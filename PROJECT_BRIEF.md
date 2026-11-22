@@ -26,7 +26,7 @@ data/          # Local datasets (gitignored; never committed)
 
 ## Key 2026 API Specifications
 - **Polymarket Data API v2**: filter market trades with `condition=`, enforce `taker_only=true` to avoid maker/taker double-counting, and paginate via `next_cursor`.
-- **Kalshi API**: partition historical vs. active data using the `historical/cutoff` boundary; note that orderbook responses are **bid-only** (YES and NO bids) and sorted in **ascending** price order (implied asks derived from complementary `100 - bid` levels).
+- **Kalshi API**: partition historical vs. active data using the `historical/cutoff` boundary; note that `orderbook_fp` responses are **bid-only** (`yes_dollars` and `no_dollars` fixed-point dollar strings, parsed as `Decimal`) and sorted in **ascending** price order (best bid is last; implied asks derived from complementary `1 - bid` levels).
 
 ## Working Rules
 - **Language rule**: chat communication is in **Italian**; everything inside the repository (code, comments, docstrings, markdown, commit messages) must be in **English**.
