@@ -1,0 +1,62 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "pm-quant"
+version = "0.1.0"
+description = "Hierarchical Bayesian calibration, L2 execution modeling, and Bayesian Kelly sizing for binary prediction markets."
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "polars",
+    "duckdb",
+    "httpx",
+    "scipy",
+    "statsmodels",
+    "scikit-learn",
+]
+
+[dependency-groups]
+dev = [
+    "pytest",
+    "pytest-asyncio",
+    "pytest-cov",
+    "ruff",
+    "mypy",
+]
+bayes = [
+    "pymc",
+    "numpyro",
+]
+
+[tool.uv]
+default-groups = ["dev"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/pm_quant"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP"]
+
+[tool.mypy]
+python_version = "3.12"
+mypy_path = "src"
+warn_unused_configs = true
+
+[[tool.mypy.overrides]]
+module = ["pm_quant", "pm_quant.*"]
+strict = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+addopts = "-m 'not live'"
+markers = [
+    "live: marks tests hitting live external APIs (deselected by default)",
+]
