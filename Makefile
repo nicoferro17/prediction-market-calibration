@@ -4,13 +4,13 @@ install:
 	uv sync --dev
 
 lint:
-	uv run ruff check src tests
+	uv run ruff check src tests scripts
 
 format:
-	uv run ruff format --check src tests
+	uv run ruff format --check src tests scripts
 
 typecheck:
-	uv run mypy src tests
+	uv run mypy src tests scripts
 
 test:
 	uv run pytest -q
