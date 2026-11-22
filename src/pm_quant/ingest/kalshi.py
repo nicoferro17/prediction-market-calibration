@@ -518,7 +518,7 @@ class KalshiClient:
         endpoint = self._url("/markets/orderbooks")
         # Kalshi /markets/orderbooks requires repeated `tickers` query parameters
         # (?tickers=A&tickers=B); comma-joining treats "A,B" as one ticker name.
-        payload = await self._http.get_json(endpoint, params={"tickers": chunk})
+        payload = await self._http.get_json(endpoint, params={"tickers": chunk, "depth": depth})
         if not isinstance(payload, Mapping):
             raise ValueError(
                 f"expected JSON object from /markets/orderbooks, got {type(payload).__name__}"
