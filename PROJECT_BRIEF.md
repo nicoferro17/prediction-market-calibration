@@ -30,6 +30,7 @@ data/          # Local datasets (gitignored; never committed)
 
 ## Working Rules
 - **Language rule**: chat communication is in **Italian**; everything inside the repository (code, comments, docstrings, markdown, commit messages) must be in **English**.
+- **Status tracking (`STATUS.md`, <= 25 lines)**: in `## Done`, keep block-by-block detail only for the current week and compact each completed week into a single summary line (e.g., `Week 1 (week-1-done): ...`) upon closing its milestone tag.
 - **Scope & hygiene**:
   - Never install the `bayes` dependency group before **Week 9**.
   - Never commit raw/processed datasets (`data/`) or secrets (`.env`, credentials, tokens).
