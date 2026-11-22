@@ -208,14 +208,15 @@ def test_parse_clob_orderbook_resorts_disordered_levels_and_caps_top_20() -> Non
     raw_asks = [{"price": f"{ask_prices[i]:.2f}", "size": str((i + 1) * 5)} for i in ask_order]
 
     book = parse_clob_orderbook(
-        {"bids": raw_bids, "asks": raw_asks},
+        {"market": "0xcond-9988", "bids": raw_bids, "asks": raw_asks},
         token_id="99887766",
         ts_utc=FIXED_TS,
         max_depth=20,
     )
 
     assert book.venue == "polymarket"
-    assert book.market_id == "99887766"
+    assert book.market_id == "0xcond-9988"
+    assert book.token_id == "99887766"
     assert book.outcome_side == "yes"
     assert book.ts_utc == FIXED_TS
     assert book.depth_levels == (20, 20)
@@ -261,8 +262,16 @@ def test_parse_clob_orderbook_filters_dirty_levels_and_edge_cases() -> None:
         ],
     }
 
-    book = parse_clob_orderbook(raw_book, token_id="tok-dirty", ts_utc=FIXED_TS, outcome_side="no")
+    book = parse_clob_orderbook(
+        raw_book,
+        token_id="tok-dirty",
+        ts_utc=FIXED_TS,
+        outcome_side="no",
+        market_id="0xcond-explicit",
+    )
     assert book.outcome_side == "no"
+    assert book.market_id == "0xcond-explicit"
+    assert book.token_id == "tok-dirty"
     assert book.bids == (
         PriceLevel(Decimal("0.46"), Decimal("15")),
         PriceLevel(Decimal("0.42"), Decimal("25.5")),
@@ -272,7 +281,10 @@ def test_parse_clob_orderbook_filters_dirty_levels_and_edge_cases() -> None:
         PriceLevel(Decimal("0.52"), Decimal("30")),
     )
 
+    # Without explicit market_id or raw['market'], falls back cleanly to token_id.
     empty = parse_clob_orderbook(None, token_id="tok-empty", ts_utc=FIXED_TS)
+    assert empty.market_id == "tok-empty"
+    assert empty.token_id == "tok-empty"
     assert empty.bids == ()
     assert empty.asks == ()
     assert empty.best_bid is None
@@ -457,6 +469,7 @@ async def test_clob_get_orderbook_batch_and_price_history() -> None:
             return httpx.Response(
                 200,
                 json={
+                    "market": "0xcond-single",
                     "asset_id": "tok-single",
                     "bids": [{"price": "0.30", "size": "10"}, {"price": "0.45", "size": "25"}],
                     "asks": [{"price": "0.60", "size": "15"}, {"price": "0.48", "size": "40"}],
@@ -472,6 +485,7 @@ async def test_clob_get_orderbook_batch_and_price_history() -> None:
             items: list[dict[str, Any]] = []
             for idx, entry in enumerate(body):
                 item: dict[str, Any] = {
+                    "market": "0xcond-shared" if entry["token_id"] in {"tok-1", "tok-2"} else "",
                     "bids": [{"price": "0.40", "size": "50"}],
                     "asks": [{"price": "0.42", "size": "30"}],
                 }
@@ -502,6 +516,8 @@ async def test_clob_get_orderbook_batch_and_price_history() -> None:
         now_fn=lambda: FIXED_TS,
     ) as client:
         single = await client.get_orderbook("tok-single")
+        assert single.market_id == "0xcond-single"
+        assert single.token_id == "tok-single"
         assert single.best_bid == Decimal("0.45")
         assert single.best_ask == Decimal("0.48")
         assert single.ts_utc == FIXED_TS
@@ -511,12 +527,29 @@ async def test_clob_get_orderbook_batch_and_price_history() -> None:
             ["tok-1", "tok-1", "tok-2", "tok-3"],
             max_depth=10,
             max_batch_size=2,
+            outcome_sides={"tok-1": "yes", "tok-2": "no", "tok-3": "yes"},
+            market_ids={"tok-3": "0xcond-3"},
         )
         assert sorted(batch.keys()) == ["tok-1", "tok-2", "tok-3"]
+        assert batch["tok-1"].market_id == "0xcond-shared"
+        assert batch["tok-1"].token_id == "tok-1"
+        assert batch["tok-1"].outcome_side == "yes"
+        assert batch["tok-2"].market_id == "0xcond-shared"
+        assert batch["tok-2"].token_id == "tok-2"
+        assert batch["tok-2"].outcome_side == "no"
+        assert batch["tok-3"].market_id == "0xcond-3"
+        assert batch["tok-3"].token_id == "tok-3"
+        assert batch["tok-3"].outcome_side == "yes"
         assert len(post_bodies) == 2
         assert sorted(len(b) for b in post_bodies) == [1, 2]
         assert post_bodies[0] == [{"token_id": "tok-1"}, {"token_id": "tok-2"}]
         assert post_bodies[1] == [{"token_id": "tok-3"}]
+
+        with pytest.raises(ValueError, match="outcome_sides"):
+            await client.get_orderbooks_batch(
+                ["tok-1", "tok-2"],
+                outcome_sides={"tok-1": "yes"},
+            )
 
         start_dt = datetime(2026, 11, 1, 0, 0, tzinfo=UTC)
         end_dt = datetime(2026, 11, 2, 0, 0, tzinfo=UTC)
@@ -527,9 +560,10 @@ async def test_clob_get_orderbook_batch_and_price_history() -> None:
             fidelity=60,
         )
         assert hist == [
-            {"t": 1700000000, "p": 0.50},
-            {"t": 1700003600, "p": 0.55},
+            {"t": 1700000000, "p": Decimal("0.5")},
+            {"t": 1700003600, "p": Decimal("0.55")},
         ]
+        assert all(isinstance(point["p"], Decimal) for point in hist)
         assert seen_history_params[0] == {
             "market": "tok-hist",
             "startTs": str(int(start_dt.timestamp())),
@@ -547,6 +581,48 @@ async def test_clob_get_orderbook_batch_and_price_history() -> None:
             await client.get_clob_price_history("tok-hist", start_ts=300, end_ts=200)
         with pytest.raises(ValueError, match="fidelity"):
             await client.get_clob_price_history("tok-hist", fidelity=0)
+
+
+async def test_clob_get_orderbook_samples_timestamp_after_retry() -> None:
+    """get_orderbook captures ts_utc AFTER HTTP response/retries to prevent lookahead stamping."""
+    current_time = FIXED_TS
+    attempts = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            return httpx.Response(429, headers={"Retry-After": "15"}, request=request)
+        return httpx.Response(
+            200,
+            json={
+                "market": "0xcond-retry",
+                "asset_id": "tok-retry",
+                "bids": [{"price": "0.50", "size": "10"}],
+                "asks": [{"price": "0.52", "size": "10"}],
+            },
+            request=request,
+        )
+
+    async def advancing_sleep(delay: float) -> None:
+        nonlocal current_time
+        current_time = current_time + timedelta(seconds=delay)
+
+    async with AsyncRateLimitedClient(
+        transport=httpx.MockTransport(handler),
+        sleep=advancing_sleep,
+        now_fn=lambda: current_time,
+    ) as shared_http:
+        async with PolymarketClient(
+            http_client=shared_http,
+            now_fn=lambda: current_time,
+        ) as client:
+            book = await client.get_orderbook("tok-retry")
+
+    assert attempts == 2
+    assert book.market_id == "0xcond-retry"
+    assert book.token_id == "tok-retry"
+    assert book.ts_utc == FIXED_TS + timedelta(seconds=15)
 
 
 # ---------------------------------------------------------------------------
@@ -739,7 +815,7 @@ async def test_data_v2_price_history_35_day_window_splits_dedups_and_warns_on_em
                 request=request,
             )
 
-        # Block 3 (days 30..35): duplicate boundary timestamp + newer point.
+        # Block 3 (days 30..35): duplicate boundary timestamp + newer point + settlement point.
         if win_start == t0 + 30 * DAY_SECONDS:
             return httpx.Response(
                 200,
@@ -754,6 +830,11 @@ async def test_data_v2_price_history_35_day_window_splits_dedups_and_warns_on_em
                             "timestamp": t0 + 34 * DAY_SECONDS,
                             "price": 0.67,
                             "resolution_seconds": 3600,
+                        },
+                        {
+                            "timestamp": t0 + 35 * DAY_SECONDS,
+                            "price": 1.0,
+                            "resolution_seconds": 0,
                         },
                     ]
                 },
@@ -770,11 +851,18 @@ async def test_data_v2_price_history_35_day_window_splits_dedups_and_warns_on_em
                 end_ts=t_end,
                 bucket_seconds=3600,
             )
+            points_with_settlement = await client.get_v2_price_history(
+                "tok-35d",
+                start_ts=t0,
+                end_ts=t_end,
+                bucket_seconds=3600,
+                exclude_settlement=False,
+            )
 
-    # Exact 3 requests covering 15d + 15d + 5d, each <= 15 days.
-    assert len(seen_windows) == 3
-    sorted_windows = sorted(seen_windows)
-    assert sorted_windows == [
+    # Exact 3 requests per call covering 15d + 15d + 5d, each <= 15 days.
+    assert len(seen_windows) == 6
+    sorted_first_call = sorted(seen_windows[:3])
+    assert sorted_first_call == [
         (t0, t0 + 15 * DAY_SECONDS),
         (t0 + 15 * DAY_SECONDS, t0 + 30 * DAY_SECONDS),
         (t0 + 30 * DAY_SECONDS, t0 + 35 * DAY_SECONDS),
@@ -783,7 +871,7 @@ async def test_data_v2_price_history_35_day_window_splits_dedups_and_warns_on_em
         end - start <= POLYMARKET_V2_HISTORY_MAX_WINDOW_SECONDS for start, end in seen_windows
     )
 
-    # Deduplicated and strictly sorted ascending by timestamp.
+    # Deduplicated, sorted ascending, exact Decimal prices, settlement point dropped by default.
     timestamps = [p["timestamp"] for p in points]
     assert timestamps == [
         t0 + 16 * DAY_SECONDS,
@@ -791,11 +879,25 @@ async def test_data_v2_price_history_35_day_window_splits_dedups_and_warns_on_em
         t0 + 30 * DAY_SECONDS,
         t0 + 34 * DAY_SECONDS,
     ]
-    assert [p["price"] for p in points] == [0.51, 0.54, 0.60, 0.67]
+    assert [p["price"] for p in points] == [
+        Decimal("0.51"),
+        Decimal("0.54"),
+        Decimal("0.6"),
+        Decimal("0.67"),
+    ]
+    assert all(isinstance(p["price"], Decimal) for p in points)
 
-    # Warning emitted for the empty block (resolution decay).
+    # Opt-in exclude_settlement=False preserves the resolution_seconds==0 payout point.
+    assert [p["timestamp"] for p in points_with_settlement] == [
+        *timestamps,
+        t0 + 35 * DAY_SECONDS,
+    ]
+    assert points_with_settlement[-1]["price"] == Decimal("1.0")
+    assert isinstance(points_with_settlement[-1]["price"], Decimal)
+
+    # Warning emitted for the empty block (resolution decay) on each call.
     warnings = [rec.getMessage() for rec in caplog.records if rec.levelno == logging.WARNING]
-    assert len(warnings) == 1
+    assert len(warnings) == 2
     assert "empty block" in warnings[0]
     assert "tok-35d" in warnings[0]
 
@@ -828,6 +930,8 @@ async def test_data_v2_price_history_interval_mode_cursor_and_validation() -> No
     async with PolymarketClient(transport=httpx.MockTransport(handler)) as client:
         pts = await client.get_v2_price_history("tok-int", interval="1d")
         assert [p["timestamp"] for p in pts] == [100, 200]
+        assert [p["price"] for p in pts] == [Decimal("0.48"), Decimal("0.52")]
+        assert all(isinstance(p["price"], Decimal) for p in pts)
         assert calls[0] == {"token_id": "tok-int", "interval": "1d"}
         assert calls[1] == {"token_id": "tok-int", "interval": "1d", "cursor": "hist-p2"}
 
@@ -838,12 +942,23 @@ async def test_data_v2_price_history_interval_mode_cursor_and_validation() -> No
 
         with pytest.raises(ValueError, match="token_id"):
             await client.get_v2_price_history("   ", interval="1d")
+        with pytest.raises(ValueError, match="cannot be combined"):
+            await client.get_v2_price_history(
+                "tok-int",
+                start_ts=100,
+                end_ts=200,
+                interval="1d",
+            )
+        with pytest.raises(ValueError, match="requires either"):
+            await client.get_v2_price_history("tok-int")
         with pytest.raises(ValueError, match="both be provided"):
             await client.get_v2_price_history("tok-int", start_ts=100)
         with pytest.raises(ValueError, match="start_ts"):
             await client.get_v2_price_history("tok-int", start_ts=200, end_ts=100)
         with pytest.raises(ValueError, match="bucket_seconds"):
-            await client.get_v2_price_history("tok-int", interval="1d", bucket_seconds=0)
+            await client.get_v2_price_history("tok-int", interval="1d", bucket_seconds=30)
+        with pytest.raises(ValueError, match="bucket_seconds"):
+            await client.get_v2_price_history("tok-int", interval="1d", bucket_seconds=86_401)
 
 
 # ---------------------------------------------------------------------------

@@ -73,6 +73,8 @@ POLYMARKET_V2_HISTORY_MAX_WINDOW_DAYS: Final[int] = 15
 POLYMARKET_V2_HISTORY_MAX_WINDOW_SECONDS: Final[int] = (
     POLYMARKET_V2_HISTORY_MAX_WINDOW_DAYS * 86_400
 )
+POLYMARKET_V2_BUCKET_MIN_SECONDS: Final[int] = 60
+POLYMARKET_V2_BUCKET_MAX_SECONDS: Final[int] = 86_400
 
 _ZERO: Final[Decimal] = Decimal("0")
 _ONE: Final[Decimal] = Decimal("1")
@@ -403,6 +405,7 @@ def parse_clob_orderbook(
     max_depth: int = DEFAULT_ORDERBOOK_DEPTH,
     *,
     outcome_side: OutcomeSide = "yes",
+    market_id: str | None = None,
 ) -> NormalizedOrderBook:
     """Parse a Polymarket CLOB ``/book`` or ``/books`` item into ``NormalizedOrderBook``.
 
@@ -410,6 +413,12 @@ def parse_clob_orderbook(
     descending so best bid is at index 0; ``asks`` ascending so best ask is at
     index 0 — never relying on server order), filtering of ``size <= 0`` and
     out-of-range prices, and truncation to the top ``max_depth`` levels per side.
+
+    ``market_id`` is resolved from the explicit ``market_id`` argument or the
+    CLOB payload's ``market`` (``condition_id``) field so snapshots join cleanly
+    with ``MarketMetadata`` and ``TradeRecord``, falling back to ``token_id``
+    only when neither is provided. ``token_id`` is always preserved in
+    ``NormalizedOrderBook.token_id``.
     """
     clean_token_id = _non_empty_str(token_id)
     if clean_token_id is None:
@@ -419,16 +428,23 @@ def parse_clob_orderbook(
     ts_norm = _ensure_utc(ts_utc, "ts_utc")
 
     payload: Mapping[str, Any] = raw if isinstance(raw, Mapping) else {}
+    resolved_market_id = (
+        _non_empty_str(market_id)
+        or _non_empty_str(payload.get("market"))
+        or _non_empty_str(payload.get("condition_id"))
+        or clean_token_id
+    )
     bids = _parse_clob_side_levels(payload.get("bids"), descending=True, max_depth=max_depth)
     asks = _parse_clob_side_levels(payload.get("asks"), descending=False, max_depth=max_depth)
 
     return NormalizedOrderBook(
         venue="polymarket",
-        market_id=clean_token_id,
+        market_id=resolved_market_id,
         outcome_side=outcome_side,
         ts_utc=ts_norm,
         bids=bids,
         asks=asks,
+        token_id=clean_token_id,
     )
 
 
@@ -531,19 +547,34 @@ def _extract_point_timestamp(point: Mapping[str, Any], primary_key: str) -> int 
     return None
 
 
+def _is_settlement_point(point: Mapping[str, Any]) -> bool:
+    """Return ``True`` if a v2 history point marks an on-chain settlement (resolution_seconds=0)."""
+    res = point.get("resolution_seconds")
+    return not isinstance(res, bool) and isinstance(res, int | float) and res == 0
+
+
 def _deduplicate_and_sort_history(
     points: Sequence[Mapping[str, Any]],
     *,
     timestamp_key: str,
+    price_key: str,
+    exclude_settlement: bool = False,
 ) -> list[dict[str, Any]]:
-    """Deduplicate price-history points by integer timestamp and return them sorted ascending."""
+    """Normalize prices to ``Decimal``, deduplicate by timestamp, and sort ascending."""
     by_timestamp: dict[int, dict[str, Any]] = {}
     for point in points:
+        if exclude_settlement and _is_settlement_point(point):
+            continue
         ts = _extract_point_timestamp(point, timestamp_key)
         if ts is None:
             continue
+        price = _to_decimal(point.get(price_key))
+        if price is None or price < _ZERO or price > _ONE:
+            continue
         if ts not in by_timestamp:
-            by_timestamp[ts] = dict(point)
+            normalized = dict(point)
+            normalized[price_key] = price
+            by_timestamp[ts] = normalized
     return [by_timestamp[ts] for ts in sorted(by_timestamp)]
 
 
@@ -730,6 +761,7 @@ class PolymarketClient:
         *,
         max_depth: int = DEFAULT_ORDERBOOK_DEPTH,
         outcome_side: OutcomeSide = "yes",
+        market_id: str | None = None,
         ts_utc: datetime | None = None,
     ) -> NormalizedOrderBook:
         """Fetch and normalize a single L2 orderbook via ``GET /book?token_id=...``."""
@@ -738,22 +770,22 @@ class PolymarketClient:
             raise ValueError("token_id must be a non-empty string")
         if max_depth < 1:
             raise ValueError(f"max_depth must be >= 1, got {max_depth}")
-        snapshot_ts = (
-            _ensure_utc(ts_utc, "ts_utc")
-            if ts_utc is not None
-            else _ensure_utc(self._now_fn(), "ts_utc")
-        )
+        explicit_ts = _ensure_utc(ts_utc, "ts_utc") if ts_utc is not None else None
 
         endpoint = self._clob_url("/book")
         payload = await self._http.get_json(endpoint, params={"token_id": clean_token_id})
         if not isinstance(payload, Mapping):
             raise ValueError(f"expected JSON object from CLOB /book, got {type(payload).__name__}")
+        snapshot_ts = (
+            explicit_ts if explicit_ts is not None else _ensure_utc(self._now_fn(), "ts_utc")
+        )
         return parse_clob_orderbook(
             payload,
             token_id=clean_token_id,
             ts_utc=snapshot_ts,
             max_depth=max_depth,
             outcome_side=outcome_side,
+            market_id=market_id,
         )
 
     async def _fetch_orderbooks_chunk(
@@ -762,6 +794,8 @@ class PolymarketClient:
         *,
         max_depth: int,
         outcome_side: OutcomeSide,
+        outcome_sides: Mapping[str, OutcomeSide] | None,
+        market_ids: Mapping[str, str] | None,
         explicit_ts_utc: datetime | None,
     ) -> dict[str, NormalizedOrderBook]:
         endpoint = self._clob_url("/books")
@@ -787,12 +821,19 @@ class PolymarketClient:
                 entry_token_id = chunk[idx]
             if entry_token_id is None:
                 continue
+            resolved_side = (
+                outcome_sides[entry_token_id]
+                if outcome_sides is not None and entry_token_id in outcome_sides
+                else outcome_side
+            )
+            resolved_market_id = market_ids.get(entry_token_id) if market_ids is not None else None
             parsed[entry_token_id] = parse_clob_orderbook(
                 entry,
                 token_id=entry_token_id,
                 ts_utc=snapshot_ts,
                 max_depth=max_depth,
-                outcome_side=outcome_side,
+                outcome_side=resolved_side,
+                market_id=resolved_market_id,
             )
         return parsed
 
@@ -802,10 +843,19 @@ class PolymarketClient:
         *,
         max_depth: int = DEFAULT_ORDERBOOK_DEPTH,
         outcome_side: OutcomeSide = "yes",
+        outcome_sides: Mapping[str, OutcomeSide] | None = None,
+        market_ids: Mapping[str, str] | None = None,
         ts_utc: datetime | None = None,
         max_batch_size: int = POLYMARKET_MAX_BOOKS_BATCH,
     ) -> dict[str, NormalizedOrderBook]:
-        """Fetch multiple L2 orderbooks via ``POST /books`` in deduplicated chunks."""
+        """Fetch multiple L2 orderbooks via ``POST /books`` in deduplicated chunks.
+
+        When fetching mixed YES and NO outcome tokens in a single batch, pass
+        ``outcome_sides={token_id: "yes" | "no", ...}`` so each book preserves
+        its true outcome side. Optionally pass ``market_ids={token_id: condition_id}``
+        to override or supply ``NormalizedOrderBook.market_id`` when the CLOB
+        response omits ``market``.
+        """
         if max_depth < 1:
             raise ValueError(f"max_depth must be >= 1, got {max_depth}")
         if max_batch_size < 1 or max_batch_size > POLYMARKET_MAX_BOOKS_BATCH:
@@ -818,12 +868,21 @@ class PolymarketClient:
         if not chunks:
             return {}
 
+        if outcome_sides is not None:
+            missing_sides = [tid for chunk in chunks for tid in chunk if tid not in outcome_sides]
+            if missing_sides:
+                raise ValueError(
+                    f"outcome_sides missing mapping for token_id(s): {missing_sides[:5]}"
+                )
+
         chunk_results = await asyncio.gather(
             *(
                 self._fetch_orderbooks_chunk(
                     chunk,
                     max_depth=max_depth,
                     outcome_side=outcome_side,
+                    outcome_sides=outcome_sides,
+                    market_ids=market_ids,
                     explicit_ts_utc=explicit_ts,
                 )
                 for chunk in chunks
@@ -847,7 +906,8 @@ class PolymarketClient:
 
         CLOB expects ``market=<token_id>`` with either ``startTs``/``endTs`` or
         a relative ``interval`` preset, plus an optional ``fidelity`` resolution
-        in minutes. Returned points are deduplicated and sorted ascending by ``t``.
+        in minutes. Returned points have exact ``Decimal`` prices (``p``),
+        deduplicated and sorted ascending by ``t``.
         """
         clean_token_id = _non_empty_str(token_id)
         if clean_token_id is None:
@@ -892,7 +952,7 @@ class PolymarketClient:
             )
 
         mappings = [item for item in raw_history if isinstance(item, Mapping)]
-        return _deduplicate_and_sort_history(mappings, timestamp_key="t")
+        return _deduplicate_and_sort_history(mappings, timestamp_key="t", price_key="p")
 
     # ------------------------------------------------------------------
     # Data API v2
@@ -1070,24 +1130,45 @@ class PolymarketClient:
         interval: str | None = None,
         *,
         bucket_seconds: int | None = None,
+        exclude_settlement: bool = True,
     ) -> list[dict[str, Any]]:
         """Fetch historical prices from Data API v2 ``GET /v2/prices-history``.
 
-        Automatically splits explicit ``[start_ts, end_ts]`` windows spanning more
-        than 15 days into contiguous blocks of at most 15 days, logs a warning if
-        any block returns empty (historical resolution decay), and returns points
-        deduplicated and sorted ascending by ``timestamp``.
+        Enforces Data API v2 window exclusivity (either ``start_ts``/``end_ts`` or
+        ``interval``, never both or neither) and ``bucket_seconds`` in
+        ``[60, 86400]``. Automatically splits explicit ``[start_ts, end_ts]``
+        windows spanning more than 15 days into contiguous blocks of at most 15
+        days, logs a warning if any block returns empty (historical resolution
+        decay), converts ``price`` to exact ``Decimal``, optionally drops
+        non-tradable on-chain settlement points (``resolution_seconds == 0``),
+        and returns points deduplicated and sorted ascending by ``timestamp``.
         """
         clean_token_id = _non_empty_str(token_id)
         if clean_token_id is None:
             raise ValueError("token_id must be a non-empty string")
-        if bucket_seconds is not None and bucket_seconds < 1:
-            raise ValueError(f"bucket_seconds must be >= 1, got {bucket_seconds}")
+        if bucket_seconds is not None and (
+            isinstance(bucket_seconds, bool)
+            or bucket_seconds < POLYMARKET_V2_BUCKET_MIN_SECONDS
+            or bucket_seconds > POLYMARKET_V2_BUCKET_MAX_SECONDS
+        ):
+            raise ValueError(
+                f"bucket_seconds must be in [{POLYMARKET_V2_BUCKET_MIN_SECONDS}, "
+                f"{POLYMARKET_V2_BUCKET_MAX_SECONDS}], got {bucket_seconds}"
+            )
 
         clean_interval = _non_empty_str(interval)
+        has_explicit_window = start_ts is not None or end_ts is not None
 
+        if clean_interval is not None and has_explicit_window:
+            raise ValueError(
+                "Data API v2 /prices-history 'interval' cannot be combined with start_ts/end_ts"
+            )
         if (start_ts is None) != (end_ts is None):
             raise ValueError("start_ts and end_ts must either both be provided or both be None")
+        if clean_interval is None and not has_explicit_window:
+            raise ValueError(
+                "Data API v2 /prices-history requires either 'interval' or both start_ts and end_ts"
+            )
 
         if start_ts is not None and end_ts is not None:
             start_epoch = _to_epoch_seconds(start_ts, "start_ts")
@@ -1106,7 +1187,7 @@ class PolymarketClient:
                         clean_token_id,
                         start_epoch=win_start,
                         end_epoch=win_end,
-                        interval=clean_interval,
+                        interval=None,
                         bucket_seconds=bucket_seconds,
                     )
                     for win_start, win_end in windows
@@ -1115,7 +1196,12 @@ class PolymarketClient:
             all_points: list[Mapping[str, Any]] = []
             for block in block_lists:
                 all_points.extend(block)
-            return _deduplicate_and_sort_history(all_points, timestamp_key="timestamp")
+            return _deduplicate_and_sort_history(
+                all_points,
+                timestamp_key="timestamp",
+                price_key="price",
+                exclude_settlement=exclude_settlement,
+            )
 
         points = await self._fetch_v2_history_block(
             clean_token_id,
@@ -1124,4 +1210,9 @@ class PolymarketClient:
             interval=clean_interval,
             bucket_seconds=bucket_seconds,
         )
-        return _deduplicate_and_sort_history(points, timestamp_key="timestamp")
+        return _deduplicate_and_sort_history(
+            points,
+            timestamp_key="timestamp",
+            price_key="price",
+            exclude_settlement=exclude_settlement,
+        )

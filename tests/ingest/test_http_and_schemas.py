@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import random
 from dataclasses import FrozenInstanceError
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta, timezone
 from decimal import Decimal
 
 import httpx
@@ -89,6 +89,45 @@ async def test_retry_429_respects_http_date_retry_after() -> None:
     assert sleeps == [pytest.approx(7.0)]
 
 
+async def test_retry_503_honors_retry_after_and_max_retry_after_cap() -> None:
+    """HTTP 503 honors Retry-After, honoring max_retry_after cap or uncapped when None."""
+    attempts = 0
+    sleeps_capped: list[float] = []
+    sleeps_uncapped: list[float] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal attempts
+        attempts += 1
+        if attempts in (1, 3):
+            return httpx.Response(503, headers={"Retry-After": "120"}, request=request)
+        return httpx.Response(200, json={"ok": True}, request=request)
+
+    async def sleep_capped(delay: float) -> None:
+        sleeps_capped.append(delay)
+
+    async def sleep_uncapped(delay: float) -> None:
+        sleeps_uncapped.append(delay)
+
+    async with AsyncRateLimitedClient(
+        transport=httpx.MockTransport(handler),
+        max_retries=2,
+        max_retry_after=15.0,
+        sleep=sleep_capped,
+    ) as client:
+        assert await client.get_json("https://example.test/capped") == {"ok": True}
+
+    async with AsyncRateLimitedClient(
+        transport=httpx.MockTransport(handler),
+        max_retries=2,
+        max_retry_after=None,
+        sleep=sleep_uncapped,
+    ) as client:
+        assert await client.get_json("https://example.test/uncapped") == {"ok": True}
+
+    assert sleeps_capped == [pytest.approx(15.0)]
+    assert sleeps_uncapped == [pytest.approx(120.0)]
+
+
 async def test_retry_503_recovers_with_exponential_backoff_and_jitter() -> None:
     """Transient HTTP 503 responses retry with bounded exponential backoff and recover."""
     attempts = 0
@@ -152,6 +191,33 @@ async def test_retry_transport_error_recovers() -> None:
     assert attempts == 2
     assert len(sleeps) == 1
     assert 0.25 <= sleeps[0] <= 0.5
+
+
+async def test_exhausted_transport_error_reraises() -> None:
+    """Persistent httpx.TransportError re-raises once max_retries is exhausted."""
+    attempts = 0
+    sleeps: list[float] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal attempts
+        attempts += 1
+        raise httpx.ConnectTimeout("still down", request=request)
+
+    async def fake_sleep(delay: float) -> None:
+        sleeps.append(delay)
+
+    async with AsyncRateLimitedClient(
+        transport=httpx.MockTransport(handler),
+        max_retries=2,
+        backoff_base=0.5,
+        sleep=fake_sleep,
+        rng=random.Random(3),
+    ) as client:
+        with pytest.raises(httpx.ConnectTimeout, match="still down"):
+            await client.get("https://example.test/offline")
+
+    assert attempts == 3
+    assert len(sleeps) == 2
 
 
 @pytest.mark.parametrize("status_code", [400, 404, 410])
@@ -265,9 +331,11 @@ def test_orderbook_normal_and_exact_decimal_spread() -> None:
             PriceLevel(price=Decimal("0.33"), size=Decimal("100")),
             PriceLevel(price=Decimal("0.35"), size=Decimal("50")),
         ),
+        token_id="998877",
     )
 
     assert book.schema_version == SCHEMA_VERSION == "v1"
+    assert book.token_id == "998877"
     assert book.best_bid == Decimal("0.30")
     assert book.best_ask == Decimal("0.31")
     assert book.mid == Decimal("0.305")
@@ -290,6 +358,7 @@ def test_orderbook_empty_book_returns_none_safely() -> None:
         asks=(),
     )
 
+    assert book.token_id is None
     assert book.best_bid is None
     assert book.best_ask is None
     assert book.mid is None
@@ -356,13 +425,26 @@ def test_orderbook_crossed_book_detection() -> None:
     assert book.mid == Decimal("0.535")
 
 
-def test_schemas_immutability_and_validation() -> None:
-    """Normalized dataclasses are frozen/slotted and reject invalid prices or naive timestamps."""
-    ts = datetime(2026, 11, 22, 18, 0, 0, tzinfo=UTC)
+def test_schemas_immutability_utc_normalization_and_validation() -> None:
+    """Dataclasses are frozen/slotted, normalize aware timestamps to UTC, and validate bounds."""
+    ts_utc = datetime(2026, 11, 22, 18, 0, 0, tzinfo=UTC)
+    ts_plus2 = datetime(2026, 11, 22, 20, 0, 0, tzinfo=timezone(timedelta(hours=2)))
 
     level = PriceLevel(price=Decimal("0.50"), size=Decimal("10"))
     with pytest.raises(FrozenInstanceError):
         level.price = Decimal("0.51")  # type: ignore[misc]
+
+    book = NormalizedOrderBook(
+        venue="kalshi",
+        market_id="KX-TZ",
+        outcome_side="yes",
+        ts_utc=ts_plus2,
+        bids=(),
+        asks=(),
+    )
+    assert book.ts_utc == ts_utc
+    assert book.ts_utc.tzinfo is UTC
+    assert book.ts_utc.utcoffset() == timedelta(0)
 
     metadata = MarketMetadata(
         venue="polymarket",
@@ -372,10 +454,13 @@ def test_schemas_immutability_and_validation() -> None:
         category="Economics",
         outcomes=("Yes", "No"),
         is_yes_no=True,
-        end_time_utc=ts,
+        end_time_utc=ts_plus2,
         status="open",
         extra={"enable_order_book": True},
     )
+    assert metadata.end_time_utc == ts_utc
+    assert metadata.end_time_utc is not None
+    assert metadata.end_time_utc.tzinfo is UTC
     assert metadata.extra["enable_order_book"] is True
     with pytest.raises(TypeError):
         metadata.extra["mutated"] = True  # type: ignore[index]
@@ -387,18 +472,38 @@ def test_schemas_immutability_and_validation() -> None:
         price=Decimal("0.62"),
         size=Decimal("100"),
         notional_usd=Decimal("62.00"),
-        ts_utc=ts,
+        ts_utc=ts_plus2,
         side="buy",
         tx_hash="0xtxhash",
     )
     assert trade.schema_version == SCHEMA_VERSION
     assert trade.notional_usd == Decimal("62.00")
+    assert trade.ts_utc == ts_utc
+    assert trade.ts_utc.tzinfo is UTC
 
     with pytest.raises(ValueError, match="price"):
         PriceLevel(price=Decimal("1.01"), size=Decimal("1"))
 
+    with pytest.raises(ValueError, match="price"):
+        PriceLevel(price=Decimal("NaN"), size=Decimal("1"))
+
+    with pytest.raises(ValueError, match="size"):
+        PriceLevel(price=Decimal("0.50"), size=Decimal("0"))
+
     with pytest.raises(ValueError, match="size"):
         PriceLevel(price=Decimal("0.50"), size=Decimal("-1"))
+
+    with pytest.raises(ValueError, match="size"):
+        TradeRecord(
+            venue="polymarket",
+            market_id="0xcond",
+            token_id=None,
+            price=Decimal("0.50"),
+            size=Decimal("-1"),
+            notional_usd=Decimal("0"),
+            ts_utc=ts_utc,
+            side=None,
+        )
 
     with pytest.raises(ValueError, match="timezone-aware"):
         NormalizedOrderBook(

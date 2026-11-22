@@ -23,7 +23,7 @@ This document records the live API verification results for **Polymarket** and *
 | Kalshi `/historical/cutoff` (elections) | `https://api.elections.kalshi.com/trade-api/v2/historical/cutoff` | 200 | 19.8 | PASS | `market_settled_ts=2026-09-22T00:00:00Z` |
 | Kalshi `/historical/cutoff` (external) | `https://external-api.kalshi.com/trade-api/v2/historical/cutoff` | 200 | 252.1 | PASS | `market_settled_ts=2026-09-22T00:00:00Z` (matches primary) |
 | Kalshi `/markets` (open) | `https://api.elections.kalshi.com/trade-api/v2/markets` | 200 | 64.3 | PASS | `markets=5`, returned open tickers (`KXMVECROSSCATEGORY-...`) |
-| Kalshi `/markets/orderbooks` | `https://api.elections.kalshi.com/trade-api/v2/markets/orderbooks` | 200 | 59.8 | PASS | `books=1`, `yes_levels=0`, `no_levels=0`, `orderbook_fp` ascending check passed |
+| Kalshi `/markets/orderbooks` | `https://api.elections.kalshi.com/trade-api/v2/markets/orderbooks` | 200 | 59.8 | PASS | Initial run sent comma-joined `tickers` (`books=1`, `yes_levels=0`, `no_levels=0`); `scripts/smoke_test_apis.py` subsequently fixed to repeated `tickers` params matching `KalshiClient` |
 
 ### Polymarket CLOB vs. Data API v2 `/prices-history` Comparison
 
@@ -46,7 +46,7 @@ Both endpoints were queried for the same active token (`32338220190...`) with `i
 
 - Both `api.elections.kalshi.com` (`19.8 ms`, primary) and `external-api.kalshi.com` (`252.1 ms`, external mirror) report the exact same `market_settled_ts=2026-09-22T00:00:00Z` cutoff boundary separating active and historical archives. `api.elections.kalshi.com` is the preferred primary host due to significantly lower latency.
 - Batch `/markets/orderbooks` returns `orderbook_fp` objects containing bid-only fixed-point dollar arrays (`yes_dollars`, `no_dollars`) sorted in **ascending** price order (best bid is the last element; complementary asks are implied at `1 - opposite_bid`).
-- On sparse open contracts (such as newly listed cross-category combo tickers), batch orderbook responses may omit empty books or return `0` levels on one or both sides (`books=1`, `yes_levels=0`, `no_levels=0`). Normalized book schemas therefore treat empty and one-sided orderbooks as valid first-class states.
+- **Wire-format invariant**: `GET /markets/orderbooks` requires **repeated** `tickers` query parameters (`?tickers=A&tickers=B`, up to 100 tickers) and returns one entry per requested ticker; comma-joining them (`?tickers=A,B`) is silently treated by Kalshi as a single nonexistent ticker returning HTTP 200 with one empty book (`books=1`, `yes_levels=0`, `no_levels=0`), which produced the single empty entry in the initial smoke run before `scripts/smoke_test_apis.py` was fixed. Sparse open contracts (such as newly listed combo tickers) still return empty `yes_dollars`/`no_dollars` arrays, so normalized book schemas treat empty and one-sided orderbooks as valid first-class states.
 
 ---
 

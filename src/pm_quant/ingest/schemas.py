@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import UTC, datetime
 from decimal import Decimal
 from types import MappingProxyType
 from typing import Any, Final, Literal
@@ -26,26 +26,32 @@ def _validate_probability_price(value: Decimal, field_name: str = "price") -> No
         raise ValueError(f"{field_name} must be a finite Decimal in [0, 1], got {value!r}")
 
 
+def _validate_positive(value: Decimal, field_name: str) -> None:
+    if not value.is_finite() or value <= _ZERO:
+        raise ValueError(f"{field_name} must be a finite positive Decimal (> 0), got {value!r}")
+
+
 def _validate_non_negative(value: Decimal, field_name: str) -> None:
     if not value.is_finite() or value < _ZERO:
         raise ValueError(f"{field_name} must be a finite non-negative Decimal, got {value!r}")
 
 
-def _validate_tz_aware(dt: datetime, field_name: str) -> None:
+def _normalize_utc(dt: datetime, field_name: str) -> datetime:
     if dt.tzinfo is None or dt.utcoffset() is None:
         raise ValueError(f"{field_name} must be timezone-aware (UTC), got naive datetime {dt!r}")
+    return dt.astimezone(UTC)
 
 
 @dataclass(frozen=True, slots=True)
 class PriceLevel:
-    """Single aggregated L2 price level with exact Decimal price and size."""
+    """Single aggregated L2 price level with exact Decimal price and strictly positive size."""
 
     price: Decimal
     size: Decimal
 
     def __post_init__(self) -> None:
         _validate_probability_price(self.price, "price")
-        _validate_non_negative(self.size, "size")
+        _validate_positive(self.size, "size")
 
 
 @dataclass(frozen=True, slots=True)
@@ -55,7 +61,9 @@ class NormalizedOrderBook:
     By convention, ``bids`` are ordered descending by price (best bid first) and
     ``asks`` are ordered ascending by price (best ask first). Derived properties
     compute extrema directly so they remain safe even on empty, one-sided, or
-    unsorted inputs.
+    unsorted inputs. ``market_id`` holds the venue market identifier (Kalshi
+    ticker or Polymarket ``condition_id``), while ``token_id`` optionally holds
+    the venue outcome token identifier (Polymarket CLOB ``asset_id``).
     """
 
     venue: Venue
@@ -64,10 +72,11 @@ class NormalizedOrderBook:
     ts_utc: datetime
     bids: tuple[PriceLevel, ...]
     asks: tuple[PriceLevel, ...]
+    token_id: str | None = None
     schema_version: str = SCHEMA_VERSION
 
     def __post_init__(self) -> None:
-        _validate_tz_aware(self.ts_utc, "ts_utc")
+        object.__setattr__(self, "ts_utc", _normalize_utc(self.ts_utc, "ts_utc"))
 
     @property
     def best_bid(self) -> Decimal | None:
@@ -134,7 +143,11 @@ class MarketMetadata:
 
     def __post_init__(self) -> None:
         if self.end_time_utc is not None:
-            _validate_tz_aware(self.end_time_utc, "end_time_utc")
+            object.__setattr__(
+                self,
+                "end_time_utc",
+                _normalize_utc(self.end_time_utc, "end_time_utc"),
+            )
         if not isinstance(self.extra, MappingProxyType):
             object.__setattr__(self, "extra", MappingProxyType(dict(self.extra)))
 
@@ -158,4 +171,4 @@ class TradeRecord:
         _validate_probability_price(self.price, "price")
         _validate_non_negative(self.size, "size")
         _validate_non_negative(self.notional_usd, "notional_usd")
-        _validate_tz_aware(self.ts_utc, "ts_utc")
+        object.__setattr__(self, "ts_utc", _normalize_utc(self.ts_utc, "ts_utc"))

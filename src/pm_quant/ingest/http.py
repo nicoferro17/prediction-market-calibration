@@ -72,8 +72,8 @@ class AsyncRateLimitedClient:
     """Async HTTP client wrapping ``httpx.AsyncClient`` with concurrency limits and retries.
 
     Retry policy:
-    - Retries HTTP ``429`` (honoring ``Retry-After`` when present), HTTP ``5xx``, and
-      ``httpx.TransportError`` with exponential backoff and equal jitter.
+    - Retries HTTP ``429`` and ``5xx`` (honoring ``Retry-After`` on ``429`` and ``503`` when
+      present), plus ``httpx.TransportError``, with exponential backoff and equal jitter.
     - Fails fast without retrying on non-429 ``4xx`` responses (e.g. ``400``, ``404``, ``410``).
     - Bounds concurrent in-flight requests using an ``asyncio.Semaphore`` (released while sleeping).
     """
@@ -167,8 +167,8 @@ class AsyncRateLimitedClient:
         return half + self._rng.uniform(0.0, half)
 
     def _compute_retry_delay(self, attempt: int, response: httpx.Response | None) -> float:
-        """Compute delay before retrying, honoring ``Retry-After`` on HTTP 429."""
-        if response is not None and response.status_code == 429:
+        """Compute delay before retrying, honoring ``Retry-After`` on HTTP 429 and 503."""
+        if response is not None and response.status_code in (429, 503):
             retry_after = parse_retry_after(
                 response.headers.get("Retry-After"),
                 now=self._now_fn(),

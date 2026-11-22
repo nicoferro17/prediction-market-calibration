@@ -543,6 +543,28 @@ async def test_get_markets_max_pages_and_validation() -> None:
             await client.get_markets(limit=1001)
         with pytest.raises(ValueError, match="max_pages"):
             await client.get_markets(max_pages=-1)
+        with pytest.raises(ValueError, match="mutually exclusive"):
+            await client.get_markets(
+                archived=True,
+                series_ticker="KXFED",
+                event_ticker="KXFED-26DEC",
+            )
+        with pytest.raises(ValueError, match="mutually exclusive"):
+            await client.get_markets(
+                archived=True,
+                series_ticker="KXFED",
+                mve_filter="exclude",
+            )
+        with pytest.raises(ValueError, match="mve_filter='exclude'"):
+            await client.get_markets(archived=True, mve_filter="only")
+
+        # Single valid filter on /historical/markets succeeds.
+        filtered_archived = await client.get_markets(
+            archived=True,
+            mve_filter="exclude",
+            max_pages=1,
+        )
+        assert [m.market_id for m in filtered_archived] == ["KX-2"]
 
 
 # ---------------------------------------------------------------------------

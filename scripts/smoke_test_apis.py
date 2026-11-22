@@ -10,6 +10,7 @@ import json
 import re
 import sys
 import time
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from decimal import Decimal, InvalidOperation
@@ -74,7 +75,7 @@ def _request_json(
     client: httpx.Client,
     endpoint: str,
     url: str,
-    params: dict[str, str | int] | None = None,
+    params: Mapping[str, str | int | list[str]] | None = None,
 ) -> tuple[CheckResult | None, Any, float]:
     """Send a GET request and decode JSON, returning a failed CheckResult on HTTP/network error."""
     start = time.perf_counter()
@@ -617,11 +618,14 @@ def check_kalshi_batch_orderbooks(client: httpx.Client, tickers: list[str]) -> C
             notes="skipped: fewer than 2 open tickers",
         )
 
+    requested_tickers = tickers[:2]
+    # Kalshi /markets/orderbooks requires repeated `tickers` query parameters
+    # (?tickers=A&tickers=B); comma-joining returns 1 empty book for "A,B".
     err, payload, latency_ms = _request_json(
         client,
         endpoint,
         url,
-        params={"tickers": ",".join(tickers[:2]), "depth": 20},
+        params={"tickers": requested_tickers, "depth": 20},
     )
     if err is not None:
         return err
@@ -638,18 +642,22 @@ def check_kalshi_batch_orderbooks(client: httpx.Client, tickers: list[str]) -> C
         )
 
     orderbooks = payload["orderbooks"]
-    if not orderbooks:
+    if len(orderbooks) != len(requested_tickers):
         return CheckResult(
             endpoint=endpoint,
             url=url,
             status_code=200,
             latency_ms=latency_ms,
             schema_ok=False,
-            notes="empty orderbooks list",
+            notes=(
+                f"expected {len(requested_tickers)} orderbooks for {requested_tickers}, "
+                f"got {len(orderbooks)}"
+            ),
         )
 
     total_yes = 0
     total_no = 0
+    returned_tickers: list[str] = []
     for idx, entry in enumerate(orderbooks):
         if not isinstance(entry, dict):
             return CheckResult(
@@ -660,6 +668,9 @@ def check_kalshi_batch_orderbooks(client: httpx.Client, tickers: list[str]) -> C
                 schema_ok=False,
                 notes=f"orderbooks[{idx}] is not an object",
             )
+        entry_ticker = entry.get("ticker")
+        if isinstance(entry_ticker, str) and entry_ticker.strip():
+            returned_tickers.append(entry_ticker.strip())
         ob_fp = entry.get("orderbook_fp")
         if not isinstance(ob_fp, dict):
             return CheckResult(
@@ -705,6 +716,18 @@ def check_kalshi_batch_orderbooks(client: httpx.Client, tickers: list[str]) -> C
             )
         total_yes += yes_cnt
         total_no += no_cnt
+
+    if set(returned_tickers) != set(requested_tickers):
+        return CheckResult(
+            endpoint=endpoint,
+            url=url,
+            status_code=200,
+            latency_ms=latency_ms,
+            schema_ok=False,
+            notes=(
+                f"returned tickers {returned_tickers} did not match requested {requested_tickers}"
+            ),
+        )
 
     return CheckResult(
         endpoint=endpoint,

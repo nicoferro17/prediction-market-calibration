@@ -447,13 +447,43 @@ class KalshiClient:
         """Paginate through live (``/markets``) or archived (``/historical/markets``) markets.
 
         Note that ``GET /historical/markets`` only holds settled markets and does
-        not accept a ``status`` query filter, so ``status`` is omitted when
-        ``archived=True``. Results are deduplicated by market ticker across pages.
+        not accept a ``status`` query filter (omitted when ``archived=True``).
+        Per Kalshi's 2026 OpenAPI spec, ``/historical/markets`` filters
+        (``series_ticker``, ``event_ticker``, ``mve_filter``) are mutually
+        exclusive and ``mve_filter`` only accepts ``"exclude"``. Results are
+        deduplicated by market ticker across pages.
         """
         if limit < 1 or limit > KALSHI_MAX_PAGE_LIMIT:
             raise ValueError(f"limit must be in [1, {KALSHI_MAX_PAGE_LIMIT}], got {limit}")
         if max_pages is not None and max_pages < 0:
             raise ValueError(f"max_pages must be >= 0 or None, got {max_pages}")
+
+        clean_status = _non_empty_str(status)
+        clean_series = _non_empty_str(series_ticker)
+        clean_event = _non_empty_str(event_ticker)
+        clean_mve = _non_empty_str(mve_filter)
+
+        if archived:
+            active_filters = [
+                name
+                for name, value in (
+                    ("series_ticker", clean_series),
+                    ("event_ticker", clean_event),
+                    ("mve_filter", clean_mve),
+                )
+                if value is not None
+            ]
+            if len(active_filters) > 1:
+                raise ValueError(
+                    "Kalshi /historical/markets filters are mutually exclusive, "
+                    f"got {active_filters}"
+                )
+            if clean_mve is not None and clean_mve != "exclude":
+                raise ValueError(
+                    "Kalshi /historical/markets only supports mve_filter='exclude', "
+                    f"got {clean_mve!r}"
+                )
+
         if max_pages == 0:
             return []
 
@@ -465,14 +495,14 @@ class KalshiClient:
 
         while True:
             params: dict[str, Any] = {"limit": limit}
-            if not archived and status is not None and status.strip():
-                params["status"] = status.strip()
-            if series_ticker is not None and series_ticker.strip():
-                params["series_ticker"] = series_ticker.strip()
-            if event_ticker is not None and event_ticker.strip():
-                params["event_ticker"] = event_ticker.strip()
-            if mve_filter is not None and mve_filter.strip():
-                params["mve_filter"] = mve_filter.strip()
+            if not archived and clean_status is not None:
+                params["status"] = clean_status
+            if clean_series is not None:
+                params["series_ticker"] = clean_series
+            if clean_event is not None:
+                params["event_ticker"] = clean_event
+            if clean_mve is not None:
+                params["mve_filter"] = clean_mve
             if cursor is not None:
                 params["cursor"] = cursor
 
