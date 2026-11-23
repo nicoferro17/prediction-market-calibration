@@ -7,6 +7,14 @@ from pm_quant.ingest.collector import (
     CollectionSummary,
     collect_daily_l2,
 )
+from pm_quant.ingest.hf_sync import (
+    DEFAULT_HF_PATH_PREFIX,
+    HF_DATASET_REPO_ENV,
+    HF_TOKEN_ENV,
+    HfUploadApi,
+    upload_daily_parquet,
+    validate_daily_parquet_for_upload,
+)
 from pm_quant.ingest.http import AsyncRateLimitedClient, NowFn, parse_retry_after
 from pm_quant.ingest.kalshi import (
     DEFAULT_KALSHI_BASE_URL,
@@ -77,6 +85,7 @@ __all__ = [
     "DEFAULT_CLOB_BASE_URL",
     "DEFAULT_DATA_API_V2_BASE_URL",
     "DEFAULT_GAMMA_BASE_URL",
+    "DEFAULT_HF_PATH_PREFIX",
     "DEFAULT_KALSHI_BASE_URL",
     "DEFAULT_KALSHI_MAX_PAGES",
     "DEFAULT_L2_MAX_DEPTH",
@@ -87,6 +96,9 @@ __all__ = [
     "DEFAULT_TARGET_SERIES_PREFIXES",
     "DEFAULT_WEATHER_SERIES_PREFIXES",
     "DEFAULT_WEEKLY_SERIES_PREFIXES",
+    "HF_DATASET_REPO_ENV",
+    "HF_TOKEN_ENV",
+    "HfUploadApi",
     "KALSHI_EXTERNAL_BASE_URL",
     "KALSHI_MAX_BATCH_TICKERS",
     "KalshiClient",
@@ -131,5 +143,7 @@ __all__ = [
     "parse_v2_trade",
     "read_snapshots_duckdb",
     "select_universe",
+    "upload_daily_parquet",
+    "validate_daily_parquet_for_upload",
     "write_daily_parquet",
 ]

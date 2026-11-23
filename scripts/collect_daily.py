@@ -22,9 +22,11 @@ from pm_quant.ingest import (
     CollectionSummary,
     UniversePolicy,
     collect_daily_l2,
+    upload_daily_parquet,
 )
 
 DEFAULT_OUTPUT_DIR = Path("data/l2_snapshots")
+logger = logging.getLogger(__name__)
 
 
 def _parse_iso_date(raw: str) -> date:
@@ -114,12 +116,27 @@ def build_parser() -> argparse.ArgumentParser:
         help="Write the local Parquet snapshot only without uploading to remote storage.",
     )
     parser.add_argument(
+        "--upload-hf",
+        action="store_true",
+        default=False,
+        help=(
+            "Upload the written Parquet snapshot to Hugging Face Datasets "
+            "(always skipped when --dry-run is active)."
+        ),
+    )
+    parser.add_argument(
+        "--hf-repo",
+        type=str,
+        default=None,
+        help="Hugging Face dataset repository ID (overrides HF_DATASET_REPO env var).",
+    )
+    parser.add_argument(
         "--fail-on-partial",
         action="store_true",
         default=False,
         help=(
-            "After writing the Parquet snapshot, exit with a non-zero code if "
-            "any venue failed (for CI alerting)."
+            "After writing (and optionally uploading) the Parquet snapshot, exit with a "
+            "non-zero code if any venue failed (for CI alerting)."
         ),
     )
     return parser
@@ -145,13 +162,24 @@ def build_policy(
     )
 
 
-def format_summary_table(summary: CollectionSummary, *, dry_run: bool = False) -> str:
+def format_summary_table(
+    summary: CollectionSummary,
+    *,
+    dry_run: bool = False,
+    upload_hf: bool = False,
+    upload_ref: str | None = None,
+) -> str:
     """Format ``CollectionSummary`` as a compact aligned ASCII table."""
     size_kb = summary.file_size_bytes / 1024.0
     failed_display = ", ".join(summary.failed_venues) if summary.failed_venues else "none"
-    mode_display = (
-        "dry-run (local Parquet only)" if dry_run else "local Parquet (no upload configured)"
-    )
+    if dry_run and upload_hf:
+        mode_display = "dry-run (HF upload skipped)"
+    elif dry_run:
+        mode_display = "dry-run (local Parquet only)"
+    elif upload_ref is not None:
+        mode_display = "local Parquet + Hugging Face upload"
+    else:
+        mode_display = "local Parquet (no upload configured)"
 
     rows: list[tuple[str, str]] = [
         ("Snapshot date (UTC)", summary.snapshot_date.isoformat()),
@@ -168,6 +196,10 @@ def format_summary_table(summary: CollectionSummary, *, dry_run: bool = False) -
         ("Parquet path", str(summary.parquet_path)),
         ("Parquet size", f"{size_kb:.2f} KB ({summary.file_size_bytes} B)"),
     ]
+    if dry_run and upload_hf:
+        rows.append(("HF upload", "skipped (--dry-run)"))
+    elif upload_ref is not None:
+        rows.append(("HF upload", upload_ref))
 
     metric_header = "Metric"
     value_header = "Value"
@@ -210,7 +242,36 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(f"ERROR: Daily L2 snapshot collection failed: {exc}", file=sys.stderr)
         return 1
 
-    print(format_summary_table(summary, dry_run=args.dry_run))
+    upload_ref: str | None = None
+    if args.upload_hf and args.dry_run:
+        msg = "Skipping Hugging Face upload because --dry-run is active."
+        logger.info(msg)
+        print(f"INFO: {msg}")
+    elif args.upload_hf:
+        try:
+            upload_ref = upload_daily_parquet(
+                summary.parquet_path,
+                repo_id=args.hf_repo,
+            )
+        except Exception as exc:
+            print(
+                format_summary_table(
+                    summary,
+                    dry_run=args.dry_run,
+                    upload_hf=args.upload_hf,
+                )
+            )
+            print(f"ERROR: Hugging Face upload failed: {exc}", file=sys.stderr)
+            return 1
+
+    print(
+        format_summary_table(
+            summary,
+            dry_run=args.dry_run,
+            upload_hf=args.upload_hf,
+            upload_ref=upload_ref,
+        )
+    )
 
     if args.fail_on_partial and summary.failed_venues:
         print(
