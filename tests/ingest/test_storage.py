@@ -576,3 +576,55 @@ def test_verify_l2_snapshot_catches_invariant_violations(tmp_path: Path) -> None
     assert report_f.ok is False
     assert report_f.checks["venue_and_reason_breakdown"] is False
     assert verify_mod.main([str(one_venue_path)]) == 1
+
+
+def test_verify_l2_snapshot_one_sided_books_pass_and_bad_non_null_fails(tmp_path: Path) -> None:
+    verify_mod = _load_verify_script()
+
+    records = [
+        _make_record(
+            venue="polymarket",
+            market_id="0xpoly_bids_only",
+            outcome_side="yes",
+            selection_reason="target_series",
+            bids=(PriceLevel(Decimal("0.42"), Decimal("50")),),
+            asks=(),
+        ),
+        _make_record(
+            venue="polymarket",
+            market_id="0xpoly_empty",
+            outcome_side="no",
+            selection_reason="volume_core",
+            bids=(),
+            asks=(),
+        ),
+        _make_record(
+            venue="kalshi",
+            market_id="KXCPI-26DEC",
+            outcome_side="yes",
+            token_id=None,
+            selection_reason="target_series",
+            volume_24h_unit="contracts",
+            extra={},
+            outcome_label=None,
+            bids=(),
+            asks=(PriceLevel(Decimal("0.61"), Decimal("100")),),
+        ),
+    ]
+    one_sided_path = write_daily_parquet(records, tmp_path / "valid", date(2026, 12, 3))
+    report = verify_mod.verify_l2_snapshots(one_sided_path)
+    assert report.ok is True
+    assert report.checks["price_range_and_ordering"] is True
+    assert report.checks["venue_and_reason_breakdown"] is True
+
+    # A non-null best_ask outside (0, 1) on a one-sided book must still fail invariant (c).
+    bad_one_sided_path = tmp_path / "bad_one_sided.parquet"
+    pl.read_parquet(one_sided_path).with_columns(
+        pl.when(pl.col("market_id") == "KXCPI-26DEC")
+        .then(pl.lit(Decimal("0.000000"), dtype=pl.Decimal(12, 6)))
+        .otherwise(pl.col("best_ask"))
+        .alias("best_ask")
+    ).write_parquet(bad_one_sided_path)
+    bad_report = verify_mod.verify_l2_snapshots(bad_one_sided_path)
+    assert bad_report.ok is False
+    assert bad_report.checks["price_range_and_ordering"] is False
