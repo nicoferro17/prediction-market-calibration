@@ -55,6 +55,7 @@ from pm_quant.ingest.schemas import (
     TradeRecord,
     TradeSide,
 )
+from pm_quant.ingest.universe import LiveMarketCandidate
 
 logger = logging.getLogger(__name__)
 
@@ -354,6 +355,87 @@ def parse_gamma_market(raw: Mapping[str, Any]) -> MarketMetadata:
         end_time_utc=end_time_utc,
         status=status,
         extra=extra,
+    )
+
+
+def _parse_non_negative_decimal(value: Any) -> Decimal | None:
+    """Convert a scalar to a finite non-negative ``Decimal``, or ``None``."""
+    dec = _to_decimal(value)
+    if dec is None or dec < _ZERO:
+        return None
+    return dec
+
+
+def _extract_gamma_tag_ids(
+    raw: Mapping[str, Any],
+    extra_tag_ids: Sequence[str | int] | None = None,
+) -> tuple[str, ...]:
+    """Extract normalized Gamma tag IDs from top-level fields, nested events, and caller context."""
+    found: list[str] = []
+
+    def _collect_tags_field(raw_tags: Any) -> None:
+        if isinstance(raw_tags, list | tuple):
+            for entry in raw_tags:
+                if isinstance(entry, Mapping):
+                    tid = _id_to_str(entry.get("id"))
+                else:
+                    tid = _id_to_str(entry)
+                if tid is not None:
+                    found.append(tid)
+
+    _collect_tags_field(raw.get("tags"))
+    for key in ("tagIds", "tag_ids"):
+        found.extend(_parse_string_sequence(raw.get(key)))
+
+    events = raw.get("events")
+    if isinstance(events, list):
+        for event in events:
+            if isinstance(event, Mapping):
+                _collect_tags_field(event.get("tags"))
+
+    if extra_tag_ids is not None:
+        for extra_tag in extra_tag_ids:
+            tid = _id_to_str(extra_tag)
+            if tid is not None:
+                found.append(tid)
+
+    return tuple(dict.fromkeys(found))
+
+
+def parse_gamma_live_candidate(
+    raw: Mapping[str, Any],
+    *,
+    tag_ids: Sequence[str | int] | None = None,
+) -> LiveMarketCandidate:
+    """Parse a raw Gamma market payload into a live screening ``LiveMarketCandidate``.
+
+    Delegates metadata extraction strictly to :func:`parse_gamma_market` (keeping
+    ``MarketMetadata.extra`` free of volume/liquidity fields) and extracts
+    ``volume24hr`` (USD notional) for live ``t_now`` universe screening only.
+    """
+    metadata = parse_gamma_market(raw)
+
+    volume_24h: Decimal | None = None
+    for vol_key in ("volume24hr", "volume24hrClob", "volume_24hr"):
+        parsed_vol = _parse_non_negative_decimal(raw.get(vol_key))
+        if parsed_vol is not None:
+            volume_24h = parsed_vol
+            break
+
+    open_interest: Decimal | None = None
+    for oi_key in ("openInterest", "open_interest"):
+        parsed_oi = _parse_non_negative_decimal(raw.get(oi_key))
+        if parsed_oi is not None:
+            open_interest = parsed_oi
+            break
+
+    extracted_tags = _extract_gamma_tag_ids(raw, tag_ids)
+    return LiveMarketCandidate(
+        metadata=metadata,
+        volume_24h=volume_24h,
+        open_interest=open_interest,
+        volume_24h_unit="usd",
+        tag_ids=extracted_tags,
     )
 
 
@@ -671,7 +753,7 @@ class PolymarketClient:
     # Gamma API
     # ------------------------------------------------------------------
 
-    async def get_markets(
+    async def _fetch_gamma_markets_raw(
         self,
         *,
         active: bool | None = True,
@@ -684,13 +766,7 @@ class PolymarketClient:
         ascending: bool | None = None,
         tag_id: int | str | None = None,
         slug: str | None = None,
-    ) -> list[MarketMetadata]:
-        """Paginate through Polymarket Gamma ``GET /markets`` with limit/offset pagination.
-
-        Stops when an empty or short page (``len(page) < limit``) is returned, or
-        once ``max_pages`` pages have been fetched. Deduplicates markets by
-        ``conditionId`` across pages.
-        """
+    ) -> list[Mapping[str, Any]]:
         if limit < 1 or limit > POLYMARKET_GAMMA_MAX_LIMIT:
             raise ValueError(f"limit must be in [1, {POLYMARKET_GAMMA_MAX_LIMIT}], got {limit}")
         if offset < 0:
@@ -701,8 +777,7 @@ class PolymarketClient:
             return []
 
         endpoint = self._gamma_url("/markets")
-        results: list[MarketMetadata] = []
-        seen_conditions: set[str] = set()
+        raw_items: list[Mapping[str, Any]] = []
         current_offset = offset
         pages_fetched = 0
 
@@ -735,12 +810,8 @@ class PolymarketClient:
                 break
 
             for item in payload:
-                if not isinstance(item, Mapping):
-                    continue
-                metadata = parse_gamma_market(item)
-                if metadata.market_id not in seen_conditions:
-                    seen_conditions.add(metadata.market_id)
-                    results.append(metadata)
+                if isinstance(item, Mapping):
+                    raw_items.append(item)
 
             pages_fetched += 1
             if max_pages is not None and pages_fetched >= max_pages:
@@ -749,6 +820,92 @@ class PolymarketClient:
                 break
             current_offset += len(payload)
 
+        return raw_items
+
+    async def get_markets(
+        self,
+        *,
+        active: bool | None = True,
+        closed: bool | None = False,
+        archived: bool | None = None,
+        limit: int = DEFAULT_GAMMA_LIMIT,
+        offset: int = 0,
+        max_pages: int | None = None,
+        order: str | None = None,
+        ascending: bool | None = None,
+        tag_id: int | str | None = None,
+        slug: str | None = None,
+    ) -> list[MarketMetadata]:
+        """Paginate through Polymarket Gamma ``GET /markets`` with limit/offset pagination.
+
+        Stops when an empty or short page (``len(page) < limit``) is returned, or
+        once ``max_pages`` pages have been fetched. Deduplicates markets by
+        ``conditionId`` across pages.
+        """
+        raw_items = await self._fetch_gamma_markets_raw(
+            active=active,
+            closed=closed,
+            archived=archived,
+            limit=limit,
+            offset=offset,
+            max_pages=max_pages,
+            order=order,
+            ascending=ascending,
+            tag_id=tag_id,
+            slug=slug,
+        )
+        results: list[MarketMetadata] = []
+        seen_conditions: set[str] = set()
+        for item in raw_items:
+            metadata = parse_gamma_market(item)
+            if metadata.market_id not in seen_conditions:
+                seen_conditions.add(metadata.market_id)
+                results.append(metadata)
+        return results
+
+    async def get_live_market_candidates(
+        self,
+        *,
+        active: bool | None = True,
+        closed: bool | None = False,
+        archived: bool | None = None,
+        limit: int = DEFAULT_GAMMA_LIMIT,
+        offset: int = 0,
+        max_pages: int | None = None,
+        order: str | None = None,
+        ascending: bool | None = None,
+        tag_id: int | str | None = None,
+        slug: str | None = None,
+    ) -> list[LiveMarketCandidate]:
+        """Fetch active Gamma ``/markets`` as live screening ``LiveMarketCandidate`` objects.
+
+        Defaults to ``active=True, closed=False`` and supports an optional
+        ``tag_id`` for targeted Weather/Economics series screening. Extracts
+        ``volume24hr`` (USD notional) via :func:`parse_gamma_live_candidate`
+        without exposing volume/liquidity on ``MarketMetadata.extra``.
+        """
+        raw_items = await self._fetch_gamma_markets_raw(
+            active=active,
+            closed=closed,
+            archived=archived,
+            limit=limit,
+            offset=offset,
+            max_pages=max_pages,
+            order=order,
+            ascending=ascending,
+            tag_id=tag_id,
+            slug=slug,
+        )
+        tag_str = _id_to_str(tag_id) if tag_id is not None else None
+        extra_tags = (tag_str,) if tag_str is not None else None
+
+        results: list[LiveMarketCandidate] = []
+        seen_conditions: set[str] = set()
+        for item in raw_items:
+            candidate = parse_gamma_live_candidate(item, tag_ids=extra_tags)
+            if candidate.metadata.market_id not in seen_conditions:
+                seen_conditions.add(candidate.metadata.market_id)
+                results.append(candidate)
         return results
 
     # ------------------------------------------------------------------

@@ -37,6 +37,7 @@ from pm_quant.ingest.http import (
     NowFn,
 )
 from pm_quant.ingest.schemas import MarketMetadata, NormalizedOrderBook, PriceLevel
+from pm_quant.ingest.universe import LiveMarketCandidate
 
 DEFAULT_KALSHI_BASE_URL: Final[str] = "https://api.elections.kalshi.com/trade-api/v2"
 KALSHI_EXTERNAL_BASE_URL: Final[str] = "https://external-api.kalshi.com/trade-api/v2"
@@ -317,6 +318,46 @@ def parse_kalshi_market(raw: Mapping[str, Any]) -> MarketMetadata:
     )
 
 
+def _parse_non_negative_decimal(value: Any) -> Decimal | None:
+    """Convert a scalar to a finite non-negative ``Decimal``, or ``None``."""
+    dec = _to_decimal(value)
+    if dec is None or dec < _ZERO:
+        return None
+    return dec
+
+
+def parse_kalshi_live_candidate(raw: Mapping[str, Any]) -> LiveMarketCandidate:
+    """Parse a raw Kalshi market payload into a live screening ``LiveMarketCandidate``.
+
+    Delegates metadata extraction strictly to :func:`parse_kalshi_market` and
+    extracts ``volume_24h_fp`` / ``volume_24h`` (in contracts/face-value) plus
+    ``open_interest_fp`` / ``open_interest`` strictly for live ``t_now``
+    universe screening.
+    """
+    metadata = parse_kalshi_market(raw)
+
+    volume_24h: Decimal | None = None
+    for vol_key in ("volume_24h_fp", "volume_24h"):
+        parsed_vol = _parse_non_negative_decimal(raw.get(vol_key))
+        if parsed_vol is not None:
+            volume_24h = parsed_vol
+            break
+
+    open_interest: Decimal | None = None
+    for oi_key in ("open_interest_fp", "open_interest"):
+        parsed_oi = _parse_non_negative_decimal(raw.get(oi_key))
+        if parsed_oi is not None:
+            open_interest = parsed_oi
+            break
+
+    return LiveMarketCandidate(
+        metadata=metadata,
+        volume_24h=volume_24h,
+        open_interest=open_interest,
+        volume_24h_unit="contracts",
+    )
+
+
 def _chunk_tickers(tickers: Sequence[str], chunk_size: int) -> list[list[str]]:
     """Deduplicate non-empty tickers in order and split into fixed-size chunks."""
     unique = list(dict.fromkeys(clean for raw in tickers if (clean := raw.strip())))
@@ -433,26 +474,17 @@ class KalshiClient:
         cutoff = await self.get_historical_cutoff()
         return settled_utc < cutoff
 
-    async def get_markets(
+    async def _fetch_markets_raw(
         self,
+        *,
         status: str | None = "open",
         archived: bool = False,
         limit: int = DEFAULT_MARKETS_LIMIT,
         max_pages: int | None = None,
-        *,
         series_ticker: str | None = None,
         event_ticker: str | None = None,
         mve_filter: str | None = None,
-    ) -> list[MarketMetadata]:
-        """Paginate through live (``/markets``) or archived (``/historical/markets``) markets.
-
-        Note that ``GET /historical/markets`` only holds settled markets and does
-        not accept a ``status`` query filter (omitted when ``archived=True``).
-        Per Kalshi's 2026 OpenAPI spec, ``/historical/markets`` filters
-        (``series_ticker``, ``event_ticker``, ``mve_filter``) are mutually
-        exclusive and ``mve_filter`` only accepts ``"exclude"``. Results are
-        deduplicated by market ticker across pages.
-        """
+    ) -> list[Mapping[str, Any]]:
         if limit < 1 or limit > KALSHI_MAX_PAGE_LIMIT:
             raise ValueError(f"limit must be in [1, {KALSHI_MAX_PAGE_LIMIT}], got {limit}")
         if max_pages is not None and max_pages < 0:
@@ -488,8 +520,7 @@ class KalshiClient:
             return []
 
         endpoint = self._url("/historical/markets" if archived else "/markets")
-        results: list[MarketMetadata] = []
-        seen_tickers: set[str] = set()
+        raw_items: list[Mapping[str, Any]] = []
         cursor: str | None = None
         pages_fetched = 0
 
@@ -521,12 +552,8 @@ class KalshiClient:
                 )
 
             for item in raw_markets:
-                if not isinstance(item, Mapping):
-                    continue
-                metadata = parse_kalshi_market(item)
-                if metadata.market_id not in seen_tickers:
-                    seen_tickers.add(metadata.market_id)
-                    results.append(metadata)
+                if isinstance(item, Mapping):
+                    raw_items.append(item)
 
             pages_fetched += 1
             if max_pages is not None and pages_fetched >= max_pages:
@@ -537,6 +564,79 @@ class KalshiClient:
                 break
             cursor = next_cursor
 
+        return raw_items
+
+    async def get_markets(
+        self,
+        status: str | None = "open",
+        archived: bool = False,
+        limit: int = DEFAULT_MARKETS_LIMIT,
+        max_pages: int | None = None,
+        *,
+        series_ticker: str | None = None,
+        event_ticker: str | None = None,
+        mve_filter: str | None = None,
+    ) -> list[MarketMetadata]:
+        """Paginate through live (``/markets``) or archived (``/historical/markets``) markets.
+
+        Note that ``GET /historical/markets`` only holds settled markets and does
+        not accept a ``status`` query filter (omitted when ``archived=True``).
+        Per Kalshi's 2026 OpenAPI spec, ``/historical/markets`` filters
+        (``series_ticker``, ``event_ticker``, ``mve_filter``) are mutually
+        exclusive and ``mve_filter`` only accepts ``"exclude"``. Results are
+        deduplicated by market ticker across pages.
+        """
+        raw_items = await self._fetch_markets_raw(
+            status=status,
+            archived=archived,
+            limit=limit,
+            max_pages=max_pages,
+            series_ticker=series_ticker,
+            event_ticker=event_ticker,
+            mve_filter=mve_filter,
+        )
+        results: list[MarketMetadata] = []
+        seen_tickers: set[str] = set()
+        for item in raw_items:
+            metadata = parse_kalshi_market(item)
+            if metadata.market_id not in seen_tickers:
+                seen_tickers.add(metadata.market_id)
+                results.append(metadata)
+        return results
+
+    async def get_live_market_candidates(
+        self,
+        status: str | None = "open",
+        limit: int = DEFAULT_MARKETS_LIMIT,
+        max_pages: int | None = None,
+        *,
+        series_ticker: str | None = None,
+        event_ticker: str | None = None,
+        mve_filter: str | None = "exclude",
+    ) -> list[LiveMarketCandidate]:
+        """Fetch live Kalshi ``/markets`` as ``LiveMarketCandidate`` objects for screening.
+
+        Defaults to ``status='open'`` and ``mve_filter='exclude'`` so multi-leg
+        MVE combo markets are filtered out server-side. Extracts
+        ``volume_24h_fp`` / ``volume_24h`` (in contracts) and
+        ``open_interest_fp`` via :func:`parse_kalshi_live_candidate`.
+        """
+        raw_items = await self._fetch_markets_raw(
+            status=status,
+            archived=False,
+            limit=limit,
+            max_pages=max_pages,
+            series_ticker=series_ticker,
+            event_ticker=event_ticker,
+            mve_filter=mve_filter,
+        )
+        results: list[LiveMarketCandidate] = []
+        seen_tickers: set[str] = set()
+        for item in raw_items:
+            candidate = parse_kalshi_live_candidate(item)
+            if candidate.metadata.market_id not in seen_tickers:
+                seen_tickers.add(candidate.metadata.market_id)
+                results.append(candidate)
         return results
 
     async def _fetch_orderbooks_chunk(
