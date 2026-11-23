@@ -1,6 +1,13 @@
 """Market data ingestion clients, HTTP transport layer, and normalized schemas."""
 
-from pm_quant.ingest.http import AsyncRateLimitedClient, parse_retry_after
+from pm_quant.ingest.collector import (
+    DEFAULT_KALSHI_MAX_PAGES,
+    DEFAULT_POLYMARKET_MAX_PAGES,
+    DEFAULT_TARGET_SERIES_MAX_PAGES,
+    CollectionSummary,
+    collect_daily_l2,
+)
+from pm_quant.ingest.http import AsyncRateLimitedClient, NowFn, parse_retry_after
 from pm_quant.ingest.kalshi import (
     DEFAULT_KALSHI_BASE_URL,
     KALSHI_EXTERNAL_BASE_URL,
@@ -66,13 +73,17 @@ from pm_quant.ingest.universe import (
 
 __all__ = [
     "AsyncRateLimitedClient",
+    "CollectionSummary",
     "DEFAULT_CLOB_BASE_URL",
     "DEFAULT_DATA_API_V2_BASE_URL",
     "DEFAULT_GAMMA_BASE_URL",
     "DEFAULT_KALSHI_BASE_URL",
+    "DEFAULT_KALSHI_MAX_PAGES",
     "DEFAULT_L2_MAX_DEPTH",
     "DEFAULT_MACRO_SERIES_PREFIXES",
+    "DEFAULT_POLYMARKET_MAX_PAGES",
     "DEFAULT_TARGET_CATEGORIES",
+    "DEFAULT_TARGET_SERIES_MAX_PAGES",
     "DEFAULT_TARGET_SERIES_PREFIXES",
     "DEFAULT_WEATHER_SERIES_PREFIXES",
     "DEFAULT_WEEKLY_SERIES_PREFIXES",
@@ -86,6 +97,7 @@ __all__ = [
     "MIN_L2_MAX_DEPTH",
     "MarketMetadata",
     "NormalizedOrderBook",
+    "NowFn",
     "OutcomeSide",
     "POLYMARKET_MAX_BOOKS_BATCH",
     "POLYMARKET_MAX_CONDITION_BATCH",
@@ -103,6 +115,7 @@ __all__ = [
     "UniversePolicy",
     "Venue",
     "VolumeUnit",
+    "collect_daily_l2",
     "is_binary_non_combo",
     "is_short_term_crypto",
     "is_target_series",

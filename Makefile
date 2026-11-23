@@ -1,4 +1,4 @@
-.PHONY: install lint format typecheck test check
+.PHONY: install lint format typecheck test collect check
 
 install:
 	uv sync --dev
@@ -14,5 +14,8 @@ typecheck:
 
 test:
 	uv run pytest -q
+
+collect:
+	uv run python scripts/collect_daily.py --dry-run
 
 check: lint format typecheck test
