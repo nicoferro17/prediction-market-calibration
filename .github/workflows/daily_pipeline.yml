@@ -1,0 +1,81 @@
+name: Daily L2 Pipeline
+
+on:
+  schedule:
+    - cron: '17 15 * * *'  # 15:17 UTC daily (US liquid window, off-minute anti-queue)
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        type: boolean
+        default: false
+        description: 'Skip HF upload'
+
+concurrency:
+  group: daily-pipeline
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  daily-pipeline:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v10.4.0
+        with:
+          enable-cache: true
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: uv sync --frozen --dev
+
+      - name: Collect daily L2 snapshots
+        shell: bash
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          HF_DATASET_REPO: ${{ vars.HF_DATASET_REPO }}
+          DRY_RUN: ${{ inputs.dry_run }}
+        run: |
+          set -euo pipefail
+          mkdir -p reports
+          if [ "${DRY_RUN:-false}" = "true" ]; then
+            uv run python scripts/collect_daily.py --dry-run 2>&1 | tee reports/daily_collect_report.txt
+          else
+            uv run python scripts/collect_daily.py --upload-hf --fail-on-partial 2>&1 | tee reports/daily_collect_report.txt
+          fi
+
+      - name: Verify generated Parquet with DuckDB
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p reports
+          shopt -s nullglob
+          parquet_files=(data/l2_snapshots/*.parquet)
+          if [ ${#parquet_files[@]} -eq 0 ]; then
+            {
+              echo "## L2 Snapshot Verification (SKIPPED)"
+              echo ""
+              echo "No Parquet files found under \`data/l2_snapshots/*.parquet\`."
+            } | tee reports/daily_verification_summary.md >> "${GITHUB_STEP_SUMMARY}"
+            exit 0
+          fi
+          uv run python scripts/verify_l2_snapshot.py "data/l2_snapshots/*.parquet" \
+            --markdown-out reports/daily_verification_summary.md \
+            --write-step-summary
+
+      - name: Upload daily pipeline report
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: daily-pipeline-report
+          path: |
+            reports/daily_collect_report.txt
+            reports/daily_verification_summary.md
+          retention-days: 7
+          if-no-files-found: ignore

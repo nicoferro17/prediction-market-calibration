@@ -365,3 +365,214 @@ def test_record_immutability_and_validation_guards(tmp_path: Path) -> None:
     # Reject datetime passed as snapshot_date
     with pytest.raises(TypeError, match="datetime.date"):
         write_daily_parquet([rec], tmp_path, datetime(2026, 12, 1, 0, 0, tzinfo=UTC))
+
+
+def _load_verify_script() -> Any:
+    import importlib.util
+
+    script_path = Path(__file__).resolve().parents[2] / "scripts" / "verify_l2_snapshot.py"
+    spec = importlib.util.spec_from_file_location("verify_l2_snapshot", script_path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    import sys
+
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def _write_valid_two_venue_snapshot(tmp_path: Path) -> Path:
+    poly_target = _make_record(
+        venue="polymarket",
+        market_id="0xcond_poly_1",
+        outcome_side="yes",
+        selection_reason="target_series",
+        title="Will Bitcoin exceed $150k by Dec 2026?",
+        category="crypto",
+    )
+    poly_core_one_sided = _make_record(
+        venue="polymarket",
+        market_id="0xcond_poly_2",
+        outcome_side="no",
+        selection_reason="volume_core",
+        bids=(),
+        asks=(PriceLevel(Decimal("0.62"), Decimal("80")),),
+        title="Will Fed cut rates in December?",
+        category="economics",
+    )
+    kalshi_target = _make_record(
+        venue="kalshi",
+        market_id="KXCPI-26DEC",
+        event_id="KXCPI-26DEC",
+        outcome_side="yes",
+        token_id=None,
+        selection_reason="target_series",
+        volume_24h_unit="contracts",
+        extra={},
+        outcome_label=None,
+    )
+    kalshi_core_empty = _make_record(
+        venue="kalshi",
+        market_id="KXINXW-26DEC04",
+        event_id="KXINXW-26DEC04",
+        outcome_side="no",
+        token_id=None,
+        selection_reason="volume_core",
+        bids=(),
+        asks=(),
+        volume_24h_unit="contracts",
+        extra={},
+        outcome_label=None,
+    )
+    return write_daily_parquet(
+        [poly_target, poly_core_one_sided, kalshi_target, kalshi_core_empty],
+        tmp_path,
+        date(2026, 12, 1),
+    )
+
+
+def test_verify_l2_snapshot_passes_all_six_invariants_and_writes_summary(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    verify_mod = _load_verify_script()
+    _write_valid_two_venue_snapshot(tmp_path)
+
+    # Also test union_by_name=true across multiple days with an extra column on day 2.
+    day2_rec = _make_record(
+        venue="kalshi",
+        market_id="KXCPI-26DEC-DAY2",
+        event_id="KXCPI-26DEC",
+        outcome_side="yes",
+        token_id=None,
+        ts_utc=datetime(2026, 12, 2, 15, 17, 0, tzinfo=UTC),
+        selection_reason="target_series",
+        volume_24h_unit="contracts",
+        extra={},
+        outcome_label=None,
+    )
+    day2_frame = orderbooks_to_frame([day2_rec]).with_columns(
+        pl.lit("extra_meta").alias("extra_future_col")
+    )
+    day2_frame.write_parquet(tmp_path / "2026-12-02.parquet", compression="zstd")
+
+    report = verify_mod.verify_l2_snapshots(f"{tmp_path}/*.parquet")
+    assert report.ok is True
+    assert report.failures == ()
+    assert all(report.checks.values())
+    assert len(report.matched_files) == 2
+    assert report.total_rows == 5
+    assert report.rows_by_venue == {"kalshi": 3, "polymarket": 2}
+    assert report.rows_by_selection_reason == {"target_series": 3, "volume_core": 2}
+    assert report.max_bid_depth == 2
+    assert report.max_ask_depth == 2
+
+    md_out = tmp_path / "summary.md"
+    step_summary = tmp_path / "github_step_summary.md"
+    monkeypatch.setenv("GITHUB_STEP_SUMMARY", str(step_summary))
+
+    exit_code = verify_mod.main(
+        [
+            f"{tmp_path}/*.parquet",
+            "--markdown-out",
+            str(md_out),
+            "--write-step-summary",
+        ]
+    )
+    assert exit_code == 0
+    md_text = md_out.read_text(encoding="utf-8")
+    assert "L2 Snapshot Verification (PASS)" in md_text
+    assert "Rows (`polymarket`) | 2" in md_text
+    assert "Rows (`kalshi`) | 3" in md_text
+    assert "Breakdown (`target_series`) | 3" in md_text
+    assert "Breakdown (`volume_core`) | 2" in md_text
+    assert "Max bid depth | 2" in md_text
+    assert "Max ask depth | 2" in md_text
+    assert "KB (" in md_text
+    assert step_summary.read_text(encoding="utf-8") == md_text
+
+
+def test_verify_l2_snapshot_catches_invariant_violations(tmp_path: Path) -> None:
+    verify_mod = _load_verify_script()
+    base_path = _write_valid_two_venue_snapshot(tmp_path / "base")
+    base_df = pl.read_parquet(base_path)
+
+    # (a) Bad schema_version
+    bad_schema_path = tmp_path / "bad_schema.parquet"
+    base_df.with_columns(pl.lit("v2").alias("schema_version")).write_parquet(bad_schema_path)
+    report_a = verify_mod.verify_l2_snapshots(bad_schema_path)
+    assert report_a.ok is False
+    assert report_a.checks["schema_version_v1"] is False
+
+    # (b) Depth > 20
+    bad_depth_path = tmp_path / "bad_depth.parquet"
+    too_deep_bids = [Decimal(f"0.{50 - i:02d}") for i in range(21)]
+    base_df.with_columns(
+        pl.when(pl.col("market_id") == "0xcond_poly_1")
+        .then(pl.lit(too_deep_bids, dtype=pl.List(pl.Decimal(12, 6))))
+        .otherwise(pl.col("bid_prices"))
+        .alias("bid_prices")
+    ).write_parquet(bad_depth_path)
+    report_b = verify_mod.verify_l2_snapshots(bad_depth_path)
+    assert report_b.ok is False
+    assert report_b.checks["max_depth_le_20"] is False
+    assert report_b.max_bid_depth == 21
+
+    # (c1) best_bid outside (0, 1)
+    bad_price_path = tmp_path / "bad_price.parquet"
+    base_df.with_columns(
+        pl.when(pl.col("market_id") == "0xcond_poly_1")
+        .then(pl.lit(Decimal("1.000000"), dtype=pl.Decimal(12, 6)))
+        .otherwise(pl.col("best_bid"))
+        .alias("best_bid")
+    ).write_parquet(bad_price_path)
+    report_c1 = verify_mod.verify_l2_snapshots(bad_price_path)
+    assert report_c1.ok is False
+    assert report_c1.checks["price_range_and_ordering"] is False
+
+    # (c2) Unsorted bid_prices (ascending instead of descending) and ask_prices (descending)
+    bad_order_path = tmp_path / "bad_order.parquet"
+    base_df.with_columns(
+        pl.when(pl.col("market_id") == "0xcond_poly_1")
+        .then(pl.lit([Decimal("0.45"), Decimal("0.48")], dtype=pl.List(pl.Decimal(12, 6))))
+        .otherwise(pl.col("bid_prices"))
+        .alias("bid_prices"),
+        pl.when(pl.col("market_id") == "KXCPI-26DEC")
+        .then(pl.lit([Decimal("0.55"), Decimal("0.51")], dtype=pl.List(pl.Decimal(12, 6))))
+        .otherwise(pl.col("ask_prices"))
+        .alias("ask_prices"),
+    ).write_parquet(bad_order_path)
+    report_c2 = verify_mod.verify_l2_snapshots(bad_order_path)
+    assert report_c2.ok is False
+    assert report_c2.checks["price_range_and_ordering"] is False
+
+    # (d) Duplicate (snapshot_date, venue, market_id, outcome_side)
+    dup_path = tmp_path / "dup.parquet"
+    pl.concat([base_df, base_df.head(1)]).write_parquet(dup_path)
+    report_d = verify_mod.verify_l2_snapshots(dup_path)
+    assert report_d.ok is False
+    assert report_d.checks["no_duplicates"] is False
+
+    # (e) KXMVE* and crypto 5m/15m
+    excluded_path = tmp_path / "excluded.parquet"
+    base_df.with_columns(
+        pl.when(pl.col("market_id") == "KXCPI-26DEC")
+        .then(pl.lit("KXMVE-PARLAY-01"))
+        .when(pl.col("market_id") == "0xcond_poly_1")
+        .then(pl.lit("KXBTC15M-26DEC"))
+        .otherwise(pl.col("market_id"))
+        .alias("market_id")
+    ).write_parquet(excluded_path)
+    report_e = verify_mod.verify_l2_snapshots(excluded_path)
+    assert report_e.ok is False
+    assert report_e.checks["no_excluded_markets"] is False
+    assert any("KXMVE" in msg for msg in report_e.failures)
+    assert any("5m/15m crypto" in msg for msg in report_e.failures)
+
+    # (f) Missing venue
+    one_venue_path = tmp_path / "one_venue.parquet"
+    base_df.filter(pl.col("venue") == "polymarket").write_parquet(one_venue_path)
+    report_f = verify_mod.verify_l2_snapshots(one_venue_path)
+    assert report_f.ok is False
+    assert report_f.checks["venue_and_reason_breakdown"] is False
+    assert verify_mod.main([str(one_venue_path)]) == 1
