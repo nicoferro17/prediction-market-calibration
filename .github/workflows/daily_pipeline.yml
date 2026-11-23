@@ -37,8 +37,6 @@ jobs:
       - name: Collect daily L2 snapshots
         shell: bash
         env:
-          HF_TOKEN: ${{ secrets.HF_TOKEN }}
-          HF_DATASET_REPO: ${{ vars.HF_DATASET_REPO }}
           DRY_RUN: ${{ inputs.dry_run }}
         run: |
           set -euo pipefail
@@ -46,7 +44,7 @@ jobs:
           if [ "${DRY_RUN:-false}" = "true" ]; then
             uv run python scripts/collect_daily.py --dry-run 2>&1 | tee reports/daily_collect_report.txt
           else
-            uv run python scripts/collect_daily.py --upload-hf --fail-on-partial 2>&1 | tee reports/daily_collect_report.txt
+            uv run python scripts/collect_daily.py --fail-on-partial 2>&1 | tee reports/daily_collect_report.txt
           fi
 
       - name: Verify generated Parquet with DuckDB
@@ -68,6 +66,22 @@ jobs:
           uv run python scripts/verify_l2_snapshot.py "data/l2_snapshots/*.parquet" \
             --markdown-out reports/daily_verification_summary.md \
             --write-step-summary
+
+      - name: Upload verified Parquet to Hugging Face
+        if: ${{ success() && inputs.dry_run != true }}
+        shell: bash
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          HF_DATASET_REPO: ${{ vars.HF_DATASET_REPO }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          parquet_files=(data/l2_snapshots/*.parquet)
+          if [ ${#parquet_files[@]} -ne 1 ]; then
+            echo "ERROR: Expected exactly 1 verified Parquet file to upload, found ${#parquet_files[@]}" >&2
+            exit 1
+          fi
+          uv run python scripts/collect_daily.py --upload-only "${parquet_files[0]}" 2>&1 | tee -a reports/daily_collect_report.txt
 
       - name: Upload daily pipeline report
         if: always()

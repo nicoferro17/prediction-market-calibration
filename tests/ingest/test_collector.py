@@ -565,6 +565,7 @@ async def test_collect_daily_l2_custom_max_depth_reversed_outcomes_and_validatio
     assert summary.parquet_path == tmp_path / "2026-11-24.parquet"
 
     df = read_snapshots_duckdb(summary.parquet_path)
+    assert set(df["snapshot_date"].to_list()) == {date(2026, 11, 24)}
     assert max(df["bid_depth"].to_list()) == 15
     assert max(df["ask_depth"].to_list()) == 15
 
@@ -890,6 +891,10 @@ def test_cli_collect_daily_flags_summary_table_and_exit_codes(
             "50",
             "--max-target-series-per-venue",
             "25",
+            "--polymarket-target-tag-ids",
+            "84, 100328, 84",
+            "--kalshi-target-series",
+            "KXHIGHNY, KXCPI, KXHIGHNY",
             "--dry-run",
         ]
     )
@@ -900,6 +905,8 @@ def test_cli_collect_daily_flags_summary_table_and_exit_codes(
     assert captured_calls[0]["max_depth"] == 18
     assert captured_calls[0]["policy"].max_core_per_venue == 50
     assert captured_calls[0]["policy"].max_target_series_per_venue == 25
+    assert captured_calls[0]["policy"].polymarket_target_tag_ids == ("84", "100328")
+    assert captured_calls[0]["kalshi_target_series"] == ("KXHIGHNY", "KXCPI")
 
     out = capsys.readouterr().out
     assert "Rows (polymarket)" in out
@@ -1067,3 +1074,80 @@ async def test_collect_daily_l2_target_series_override_and_omitted_books(
     assert any("series_ticker=KXBAD" in rec.message for rec in caplog.records)
     assert any("omitted 1/2 selected tickers" in rec.message for rec in caplog.records)
     assert any("omitted 1/2 selected token_ids" in rec.message for rec in caplog.records)
+
+
+async def test_collect_daily_l2_default_policy_expands_kalshi_weather_prefixes(
+    tmp_path: Path,
+) -> None:
+    """Default policy expands bare weather prefixes into exact Kalshi series_ticker calls."""
+    queried_series: list[str] = []
+
+    def pm_handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/markets":
+            return httpx.Response(200, json=[], request=request)
+        raise AssertionError(f"Unexpected PM request: {request.url}")
+
+    def kalshi_handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/trade-api/v2/markets":
+            series = request.url.params.get("series_ticker")
+            if series is not None:
+                queried_series.append(series)
+                if series == "KXHIGHNY":
+                    return httpx.Response(
+                        200,
+                        json={
+                            "markets": [
+                                {
+                                    "ticker": "KXHIGHNY-26NOV24-T55",
+                                    "event_ticker": "KXHIGHNY-26NOV24",
+                                    "series_ticker": "KXHIGHNY",
+                                    "title": "NYC high temp > 55F?",
+                                    "status": "open",
+                                    "market_type": "binary",
+                                    "close_time": "2026-11-24T23:59:00Z",
+                                    "volume_24h_fp": "0.00",
+                                }
+                            ],
+                            "cursor": "",
+                        },
+                        request=request,
+                    )
+            return httpx.Response(200, json={"markets": [], "cursor": ""}, request=request)
+        if request.url.path == "/trade-api/v2/markets/orderbooks":
+            return httpx.Response(
+                200,
+                json={
+                    "orderbooks": [
+                        {
+                            "ticker": "KXHIGHNY-26NOV24-T55",
+                            "orderbook_fp": {
+                                "yes_dollars": [["0.4000", "10"]],
+                                "no_dollars": [["0.5800", "10"]],
+                            },
+                        }
+                    ]
+                },
+                request=request,
+            )
+        raise AssertionError(f"Unexpected Kalshi request: {request.url}")
+
+    kalshi_client = _make_kalshi_client(kalshi_handler)
+    pm_client = _make_polymarket_client(pm_handler)
+
+    try:
+        summary = await collect_daily_l2(
+            output_dir=tmp_path,
+            kalshi_client=kalshi_client,
+            polymarket_client=pm_client,
+            now_fn=lambda: FIXED_TS,
+        )
+    finally:
+        await kalshi_client._http.aclose()
+        await pm_client._http.aclose()
+
+    # Bare umbrella weather prefixes must NEVER be queried as exact series_ticker params.
+    assert {"KXHIGH", "KXLOW", "KXTEMP", "KXRAIN"}.isdisjoint(queried_series)
+    # Concrete weather series tickers and macro/weekly series ARE queried.
+    assert {"KXHIGHNY", "KXLOWTNYC", "KXRAINNYC", "KXCPI", "KXINXW"}.issubset(queried_series)
+    assert summary.rows_by_venue == {"polymarket": 0, "kalshi": 2}
+    assert summary.selected_by_reason == {"target_series": 1, "volume_core": 0}

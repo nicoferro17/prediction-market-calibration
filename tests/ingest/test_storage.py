@@ -628,3 +628,84 @@ def test_verify_l2_snapshot_one_sided_books_pass_and_bad_non_null_fails(tmp_path
     bad_report = verify_mod.verify_l2_snapshots(bad_one_sided_path)
     assert bad_report.ok is False
     assert bad_report.checks["price_range_and_ordering"] is False
+
+
+def test_write_daily_parquet_stamps_explicit_snapshot_date_and_cleans_tmp_on_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """snapshot_date matches the explicit daily filename and failed writes clean up .tmp."""
+    rec = _make_record(ts_utc=datetime(2026, 12, 1, 23, 59, 59, tzinfo=UTC))
+    explicit_date = date(2026, 12, 2)
+
+    path = write_daily_parquet([rec], tmp_path, explicit_date)
+    assert path == tmp_path / "2026-12-02.parquet"
+
+    df = read_snapshots_duckdb(path)
+    assert df["snapshot_date"].to_list() == [explicit_date]
+    assert df["ts_utc"][0] == datetime(2026, 12, 1, 23, 59, 59, tzinfo=UTC)
+
+    with pytest.raises(TypeError, match="datetime.date"):
+        orderbooks_to_frame([rec], snapshot_date=datetime(2026, 12, 2, 0, 0, tzinfo=UTC))
+
+    # Simulate a write failure and ensure the temporary .parquet.tmp file is removed.
+    def _boom(self: pl.DataFrame, *args: Any, **kwargs: Any) -> None:
+        raise OSError("disk full")
+
+    monkeypatch.setattr(pl.DataFrame, "write_parquet", _boom)
+    with pytest.raises(OSError, match="disk full"):
+        write_daily_parquet([rec], tmp_path, date(2026, 12, 3))
+
+    assert list(tmp_path.glob("*.tmp")) == []
+    assert not (tmp_path / "2026-12-03.parquet").exists()
+
+
+def test_verify_l2_snapshot_catches_inner_level_prices_top_mismatch_and_kxmulti(
+    tmp_path: Path,
+) -> None:
+    """Invariant (c) checks all inner bid/ask prices & top-of-book sync; (e) rejects KXMULTI*."""
+    verify_mod = _load_verify_script()
+    base_path = _write_valid_two_venue_snapshot(tmp_path / "base")
+    base_df = pl.read_parquet(base_path)
+
+    # (c3) Level-2 bid_price == 0.00 and ask_price == 1.00 while best_bid/best_ask stay in (0, 1).
+    bad_inner_path = tmp_path / "bad_inner.parquet"
+    base_df.with_columns(
+        pl.when(pl.col("market_id") == "0xcond_poly_1")
+        .then(pl.lit([Decimal("0.47"), Decimal("0.00")], dtype=pl.List(pl.Decimal(12, 6))))
+        .otherwise(pl.col("bid_prices"))
+        .alias("bid_prices"),
+        pl.when(pl.col("market_id") == "0xcond_poly_1")
+        .then(pl.lit([Decimal("0.49"), Decimal("1.00")], dtype=pl.List(pl.Decimal(12, 6))))
+        .otherwise(pl.col("ask_prices"))
+        .alias("ask_prices"),
+    ).write_parquet(bad_inner_path)
+    report_inner = verify_mod.verify_l2_snapshots(bad_inner_path)
+    assert report_inner.ok is False
+    assert report_inner.checks["price_range_and_ordering"] is False
+
+    # (c4) best_bid is NULL despite non-empty bid_prices.
+    bad_top_path = tmp_path / "bad_top.parquet"
+    base_df.with_columns(
+        pl.when(pl.col("market_id") == "0xcond_poly_1")
+        .then(pl.lit(None, dtype=pl.Decimal(12, 6)))
+        .otherwise(pl.col("best_bid"))
+        .alias("best_bid")
+    ).write_parquet(bad_top_path)
+    report_top = verify_mod.verify_l2_snapshots(bad_top_path)
+    assert report_top.ok is False
+    assert report_top.checks["price_range_and_ordering"] is False
+    assert any("inconsistent" in msg for msg in report_top.failures)
+
+    # (e2) KXMULTI* combo ticker must fail invariant (e).
+    kxmulti_path = tmp_path / "kxmulti.parquet"
+    base_df.with_columns(
+        pl.when(pl.col("market_id") == "KXCPI-26DEC")
+        .then(pl.lit("KXMULTI-26NOV-PARLAY"))
+        .otherwise(pl.col("market_id"))
+        .alias("market_id")
+    ).write_parquet(kxmulti_path)
+    report_multi = verify_mod.verify_l2_snapshots(kxmulti_path)
+    assert report_multi.ok is False
+    assert report_multi.checks["no_excluded_markets"] is False
+    assert any("KXMULTI" in msg for msg in report_multi.failures)

@@ -89,7 +89,7 @@ _COMBO_TEXT_RE: Final[re.Pattern[str]] = re.compile(
 # Kalshi / compact ticker identifiers like KXBTC15M-26NOV23, KXETH5M, btc15m-updown.
 _CRYPTO_TICKER_SHORT_TERM_RE: Final[re.Pattern[str]] = re.compile(
     r"(?:^|[^a-z0-9])"
-    r"(?:kx)?(?:btc|eth|sol|xrp|doge|crypto)[a-z0-9]*?(?:5|15)m(?:in)?"
+    r"(?:kx)?(?:btc|eth|sol|xrp|doge|crypto)[a-z0-9]*?(?<!\d)(?:5|15)m(?:in)?"
     r"(?:$|[^a-z0-9])",
     re.IGNORECASE,
 )

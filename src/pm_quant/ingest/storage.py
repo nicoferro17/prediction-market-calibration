@@ -154,6 +154,7 @@ def orderbooks_to_frame(
     records: Iterable[L2SnapshotRecord],
     *,
     max_depth: int = DEFAULT_L2_MAX_DEPTH,
+    snapshot_date: date | None = None,
 ) -> pl.DataFrame:
     """Convert L2 snapshot records into a strictly typed Polars DataFrame.
 
@@ -161,8 +162,12 @@ def orderbooks_to_frame(
     re-sorts bids descending and asks ascending before truncating each side to
     ``max_depth``, handles empty/one-sided books and empty input sequences, and
     orders rows deterministically by ``(venue, market_id, outcome_side)``.
+    When ``snapshot_date`` is provided, every row's ``snapshot_date`` column is
+    stamped with it so the column stays consistent with daily file partitioning.
     """
     _validate_max_depth(max_depth)
+    if snapshot_date is not None and isinstance(snapshot_date, datetime):
+        raise TypeError(f"snapshot_date must be a datetime.date, not datetime: {snapshot_date!r}")
 
     sorted_records = sorted(
         records,
@@ -206,7 +211,7 @@ def orderbooks_to_frame(
         rows.append(
             {
                 "schema_version": SCHEMA_VERSION,
-                "snapshot_date": book.ts_utc.date(),
+                "snapshot_date": snapshot_date if snapshot_date is not None else book.ts_utc.date(),
                 "ts_utc": book.ts_utc,
                 "venue": book.venue,
                 "market_id": book.market_id,
@@ -258,7 +263,7 @@ def write_daily_parquet(
     if isinstance(snapshot_date, datetime):
         raise TypeError(f"snapshot_date must be a datetime.date, not datetime: {snapshot_date!r}")
 
-    frame = orderbooks_to_frame(records, max_depth=max_depth)
+    frame = orderbooks_to_frame(records, max_depth=max_depth, snapshot_date=snapshot_date)
     if frame["schema_version"].null_count() > 0:
         raise ValueError("schema_version column must not contain null values")
 

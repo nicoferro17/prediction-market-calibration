@@ -66,6 +66,18 @@ def _parse_non_negative_int(raw: str) -> int:
     return value
 
 
+def _parse_csv_tokens(raw: str) -> tuple[str, ...]:
+    """Parse a comma-separated CLI list into deduplicated non-empty tokens."""
+    seen: set[str] = set()
+    tokens: list[str] = []
+    for part in raw.split(","):
+        cleaned = part.strip()
+        if cleaned and cleaned not in seen:
+            seen.add(cleaned)
+            tokens.append(cleaned)
+    return tuple(tokens)
+
+
 def build_parser() -> argparse.ArgumentParser:
     """Construct the CLI argument parser for daily L2 snapshot collection."""
     parser = argparse.ArgumentParser(
@@ -110,6 +122,24 @@ def build_parser() -> argparse.ArgumentParser:
         help="Optional override for UniversePolicy.max_target_series_per_venue.",
     )
     parser.add_argument(
+        "--polymarket-target-tag-ids",
+        type=_parse_csv_tokens,
+        default=None,
+        help=(
+            "Optional comma-separated Polymarket Gamma tag_id values for targeted "
+            "target_series discovery."
+        ),
+    )
+    parser.add_argument(
+        "--kalshi-target-series",
+        type=_parse_csv_tokens,
+        default=None,
+        help=(
+            "Optional comma-separated exact Kalshi series_ticker values to query "
+            "instead of the default policy expansion."
+        ),
+    )
+    parser.add_argument(
         "--dry-run",
         action="store_true",
         default=False,
@@ -122,6 +152,15 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "Upload the written Parquet snapshot to Hugging Face Datasets "
             "(always skipped when --dry-run is active)."
+        ),
+    )
+    parser.add_argument(
+        "--upload-only",
+        type=Path,
+        default=None,
+        help=(
+            "Skip API collection and upload an already-verified local YYYY-MM-DD.parquet "
+            "snapshot to Hugging Face Datasets (skipped when --dry-run is active)."
         ),
     )
     parser.add_argument(
@@ -146,8 +185,9 @@ def build_policy(
     *,
     max_core_per_venue: int | None = None,
     max_target_series_per_venue: int | None = None,
+    polymarket_target_tag_ids: Sequence[str] | None = None,
 ) -> UniversePolicy:
-    """Construct a ``UniversePolicy`` applying any CLI budget overrides."""
+    """Construct a ``UniversePolicy`` applying any CLI budget or tag overrides."""
     base = UniversePolicy()
     return replace(
         base,
@@ -158,6 +198,11 @@ def build_policy(
             max_target_series_per_venue
             if max_target_series_per_venue is not None
             else base.max_target_series_per_venue
+        ),
+        polymarket_target_tag_ids=(
+            tuple(polymarket_target_tag_ids)
+            if polymarket_target_tag_ids is not None
+            else base.polymarket_target_tag_ids
         ),
     )
 
@@ -224,9 +269,27 @@ def main(argv: Sequence[str] | None = None) -> int:
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
 
+    if args.upload_only is not None:
+        if args.dry_run:
+            msg = "Skipping Hugging Face upload because --dry-run is active."
+            logger.info(msg)
+            print(f"INFO: {msg}")
+            return 0
+        try:
+            upload_only_ref = upload_daily_parquet(
+                args.upload_only,
+                repo_id=args.hf_repo,
+            )
+        except Exception as exc:
+            print(f"ERROR: Hugging Face upload failed: {exc}", file=sys.stderr)
+            return 1
+        print(f"HF upload: {upload_only_ref}")
+        return 0
+
     policy = build_policy(
         max_core_per_venue=args.max_core_per_venue,
         max_target_series_per_venue=args.max_target_series_per_venue,
+        polymarket_target_tag_ids=args.polymarket_target_tag_ids,
     )
 
     try:
@@ -236,6 +299,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 policy=policy,
                 max_depth=args.max_depth,
                 snapshot_date=args.snapshot_date,
+                kalshi_target_series=args.kalshi_target_series,
             )
         )
     except Exception as exc:

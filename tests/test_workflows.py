@@ -59,21 +59,33 @@ def test_daily_pipeline_workflow_schedule_concurrency_and_secrets() -> None:
     assert "astral-sh/setup-uv@v10.4.0" in uses_values
     assert "actions/upload-artifact@v7" in uses_values
 
-    # Collection step passes secrets.HF_TOKEN, vars.HF_DATASET_REPO, and expected CLI flags.
-    collect_step = next(step for step in steps if step.get("name") == "Collect daily L2 snapshots")
+    # Collection step writes local Parquet only (never uploads before DuckDB verification).
+    step_names = [step.get("name") for step in steps]
+    collect_idx = step_names.index("Collect daily L2 snapshots")
+    verify_idx = step_names.index("Verify generated Parquet with DuckDB")
+    hf_upload_idx = step_names.index("Upload verified Parquet to Hugging Face")
+    assert collect_idx < verify_idx < hf_upload_idx
+
+    collect_step = steps[collect_idx]
     collect_env = collect_step["env"]
-    assert collect_env["HF_TOKEN"] == "${{ secrets.HF_TOKEN }}"
-    assert collect_env["HF_DATASET_REPO"] == "${{ vars.HF_DATASET_REPO }}"
-    assert "--upload-hf --fail-on-partial" in collect_step["run"]
+    assert "HF_TOKEN" not in collect_env
+    assert "--upload-hf" not in collect_step["run"]
+    assert "--fail-on-partial" in collect_step["run"]
     assert "--dry-run" in collect_step["run"]
 
-    # DuckDB verification step runs with if: always() and writes to $GITHUB_STEP_SUMMARY.
-    verify_step = next(
-        step for step in steps if step.get("name") == "Verify generated Parquet with DuckDB"
-    )
+    # DuckDB verification step runs with if: always() BEFORE HF upload and writes summary.
+    verify_step = steps[verify_idx]
     assert verify_step.get("if") == "always()"
     assert "scripts/verify_l2_snapshot.py" in verify_step["run"]
     assert "--write-step-summary" in verify_step["run"]
+
+    # HF upload runs strictly AFTER DuckDB verification passes and never on dry_run=true.
+    hf_upload_step = steps[hf_upload_idx]
+    assert hf_upload_step.get("if") == "${{ success() && inputs.dry_run != true }}"
+    hf_env = hf_upload_step["env"]
+    assert hf_env["HF_TOKEN"] == "${{ secrets.HF_TOKEN }}"
+    assert hf_env["HF_DATASET_REPO"] == "${{ vars.HF_DATASET_REPO }}"
+    assert "--upload-only" in hf_upload_step["run"]
 
     # Artifact upload step has retention-days: 7 and never uploads parquet files.
     upload_step = next(step for step in steps if step.get("uses") == "actions/upload-artifact@v7")

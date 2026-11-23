@@ -42,6 +42,32 @@ DEFAULT_KALSHI_MAX_PAGES: Final[int] = 10
 DEFAULT_POLYMARKET_MAX_PAGES: Final[int] = 10
 DEFAULT_TARGET_SERIES_MAX_PAGES: Final[int] = 3
 
+# Kalshi's GET /markets?series_ticker=<X> performs an exact series match, whereas
+# UniversePolicy.target_series_prefixes uses prefix matching. Map bare umbrella
+# weather prefixes to concrete exact Kalshi weather series tickers so targeted
+# discovery never wastes queries on non-existent bare prefixes.
+DEFAULT_KALSHI_WEATHER_SERIES_BY_PREFIX: Final[Mapping[str, tuple[str, ...]]] = MappingProxyType(
+    {
+        "KXHIGH": (
+            "KXHIGHNY",
+            "KXHIGHCHI",
+            "KXHIGHMIA",
+            "KXHIGHLAX",
+            "KXHIGHAUS",
+            "KXHIGHDEN",
+            "KXHIGHPHI",
+        ),
+        "KXLOW": (
+            "KXLOWTNYC",
+            "KXLOWTCHI",
+            "KXLOWTMIA",
+            "KXLOWTLAX",
+        ),
+        "KXTEMP": (),
+        "KXRAIN": ("KXRAINNYC",),
+    }
+)
+
 _VENUE_ORDER: Final[tuple[Venue, ...]] = ("polymarket", "kalshi")
 _REASON_ORDER: Final[tuple[str, ...]] = ("target_series", "volume_core")
 
@@ -75,6 +101,23 @@ def _normalize_unique_non_empty(values: Sequence[str]) -> tuple[str, ...]:
             seen.add(text)
             cleaned.append(text)
     return tuple(cleaned)
+
+
+def _resolve_kalshi_target_series(
+    policy_prefixes: Sequence[str],
+    explicit_series: Sequence[str] | None,
+) -> tuple[str, ...]:
+    """Resolve exact Kalshi ``series_ticker`` values for targeted discovery."""
+    if explicit_series is not None:
+        return _normalize_unique_non_empty(explicit_series)
+    expanded: list[str] = []
+    for prefix in _normalize_unique_non_empty(policy_prefixes):
+        upper = prefix.upper()
+        if upper in DEFAULT_KALSHI_WEATHER_SERIES_BY_PREFIX:
+            expanded.extend(DEFAULT_KALSHI_WEATHER_SERIES_BY_PREFIX[upper])
+        else:
+            expanded.append(upper)
+    return _normalize_unique_non_empty(expanded)
 
 
 @dataclass(frozen=True, slots=True)
@@ -423,10 +466,9 @@ async def collect_daily_l2(
     resolved_now_fn: NowFn = now_fn if now_fn is not None else (lambda: datetime.now(UTC))
     ts_utc = _ensure_utc(resolved_now_fn(), "ts_utc")
     resolved_snapshot_date = snapshot_date if snapshot_date is not None else ts_utc.date()
-    resolved_kalshi_series = (
-        _normalize_unique_non_empty(kalshi_target_series)
-        if kalshi_target_series is not None
-        else active_policy.target_series_prefixes
+    resolved_kalshi_series = _resolve_kalshi_target_series(
+        active_policy.target_series_prefixes,
+        kalshi_target_series,
     )
 
     failed_venue_set: set[Venue] = set()

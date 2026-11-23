@@ -31,7 +31,7 @@ tests/         # Offline unit tests (default) & opt-in live API integration test
 
 An automated GitHub Actions pipeline ([`daily_pipeline.yml`](.github/workflows/daily_pipeline.yml)) collects normalized dual-side (`yes`/`no`) L2 orderbook snapshots from Polymarket and Kalshi every day at **`17 15 * * *` UTC** (15:17 UTC) and publishes them to the public Hugging Face Dataset: [Nicoferro17/prediction-market-calibration](https://huggingface.co/datasets/Nicoferro17/prediction-market-calibration).
 
-- **Universe selection policy (`ingest/universe.py`)**: deterministic per-venue selection with separate budgets for `target_series` (macro/economics/politics series within a **45-day** resolution horizon) and `volume_core` (highest-24h-volume active markets), explicitly excluding Kalshi MVE/combo tickers (`KXMVE*`) and 5m/15m crypto markets.
+- **Universe selection policy (`ingest/universe.py`)**: deterministic per-venue selection with separate budgets for `target_series` (weather, macro/economics, and weekly recurring series within a **45-day** resolution horizon) and `volume_core` (highest-24h-volume active markets), explicitly excluding Kalshi MVE/combo tickers (`KXMVE*`/`KXMULTI*`) and 5m/15m crypto markets.
 - **Versioned Parquet schema (`ingest/storage.py`)**: Zstd-compressed daily files (`l2_snapshots/YYYY-MM-DD.parquet`) written with explicit `L2_SNAPSHOT_SCHEMA_V1` (`schema_version = 'v1'`), exact `Decimal` prices/sizes capped at top-20 depth per side (`bid_prices` desc, `ask_prices` asc), explicit `volume_24h_unit` (`usd` on Polymarket, `contracts` on Kalshi), and DuckDB `read_parquet(..., union_by_name=true)` verification (`scripts/verify_l2_snapshot.py`).
 
 ## Quickstart

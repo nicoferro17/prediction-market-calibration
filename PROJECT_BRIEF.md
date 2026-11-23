@@ -7,8 +7,8 @@ Quantitative research framework for binary prediction markets (**Polymarket** an
 
 ## Tech Stack
 - **Runtime & Packaging**: Python >= 3.12 managed with `uv`.
-- **Core dependencies**: `polars`, `duckdb`, `httpx`, `scipy`, `statsmodels`, `scikit-learn`.
-- **Dev group** (`uv sync --dev`): `pytest`, `pytest-asyncio`, `pytest-cov`, `ruff`, `mypy`.
+- **Core dependencies**: `polars`, `duckdb`, `httpx`, `scipy`, `statsmodels`, `scikit-learn`, `huggingface-hub`.
+- **Dev group** (`uv sync --dev`): `pytest`, `pytest-asyncio`, `pytest-cov`, `pyyaml`, `ruff`, `mypy`.
 - **Isolated `bayes` group**: `pymc`, `numpyro` (excluded from default sync).
 
 ## Repository Structure

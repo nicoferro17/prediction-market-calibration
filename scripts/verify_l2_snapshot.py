@@ -219,12 +219,33 @@ def verify_l2_snapshots(
         else:
             checks["max_depth_le_20"] = True
 
-        # (c) Non-null best_bid/best_ask in (0, 1) and bids desc / asks asc ordering.
+        # (c) Non-null best_bid/best_ask and all inner levels in (0, 1), top-of-book
+        #     consistency, and bids desc / asks asc ordering.
         price_row = con.execute(
             "SELECT "
             "  COUNT(*) FILTER ("
             "    WHERE (best_bid IS NOT NULL AND (best_bid <= 0 OR best_bid >= 1)) "
-            "       OR (best_ask IS NOT NULL AND (best_ask <= 0 OR best_ask >= 1))"
+            "       OR (best_ask IS NOT NULL AND (best_ask <= 0 OR best_ask >= 1)) "
+            "       OR (bid_prices IS NOT NULL AND COALESCE("
+            "            list_bool_or(list_transform(bid_prices, "
+            "              lambda x: x IS NULL OR x <= 0 OR x >= 1)), FALSE)) "
+            "       OR (ask_prices IS NOT NULL AND COALESCE("
+            "            list_bool_or(list_transform(ask_prices, "
+            "              lambda x: x IS NULL OR x <= 0 OR x >= 1)), FALSE))"
+            "  ), "
+            "  COUNT(*) FILTER ("
+            "    WHERE (bid_prices IS NOT NULL AND ("
+            "            (len(bid_prices) = 0 AND best_bid IS NOT NULL) "
+            "            OR (len(bid_prices) > 0 AND ("
+            "                 best_bid IS NULL OR bid_prices[1] IS NULL "
+            "                 OR best_bid <> bid_prices[1]))"
+            "          )) "
+            "       OR (ask_prices IS NOT NULL AND ("
+            "            (len(ask_prices) = 0 AND best_ask IS NOT NULL) "
+            "            OR (len(ask_prices) > 0 AND ("
+            "                 best_ask IS NULL OR ask_prices[1] IS NULL "
+            "                 OR best_ask <> ask_prices[1]))"
+            "          ))"
             "  ), "
             "  COUNT(*) FILTER ("
             "    WHERE bid_prices IS NOT NULL AND list_reverse_sort(bid_prices) <> bid_prices"
@@ -235,13 +256,19 @@ def verify_l2_snapshots(
             "FROM snapshots"
         ).fetchone()
         out_of_range_count = int(price_row[0]) if price_row is not None else 0
-        unsorted_bids_count = int(price_row[1]) if price_row is not None else 0
-        unsorted_asks_count = int(price_row[2]) if price_row is not None else 0
+        top_mismatch_count = int(price_row[1]) if price_row is not None else 0
+        unsorted_bids_count = int(price_row[2]) if price_row is not None else 0
+        unsorted_asks_count = int(price_row[3]) if price_row is not None else 0
         price_ok = True
         if out_of_range_count > 0:
             failures.append(
-                f"(c) Found {out_of_range_count} row(s) with non-null best_bid/best_ask "
-                "outside (0, 1)."
+                f"(c) Found {out_of_range_count} row(s) with price level(s) outside (0, 1) or NULL."
+            )
+            price_ok = False
+        if top_mismatch_count > 0:
+            failures.append(
+                f"(c) Found {top_mismatch_count} row(s) with best_bid/best_ask inconsistent "
+                "with bid_prices/ask_prices."
             )
             price_ok = False
         if unsorted_bids_count > 0:
@@ -274,13 +301,15 @@ def verify_l2_snapshots(
         else:
             checks["no_duplicates"] = True
 
-        # (e) Zero KXMVE* and zero short-term 5m/15m crypto markets.
-        kxmve_row = con.execute(
+        # (e) Zero KXMVE*/KXMULTI* combo tickers and zero short-term 5m/15m crypto markets.
+        combo_row = con.execute(
             "SELECT COUNT(*) FROM snapshots "
             "WHERE UPPER(COALESCE(market_id, '')) LIKE 'KXMVE%' "
-            "   OR UPPER(COALESCE(event_id, '')) LIKE 'KXMVE%'"
+            "   OR UPPER(COALESCE(event_id, '')) LIKE 'KXMVE%' "
+            "   OR UPPER(COALESCE(market_id, '')) LIKE 'KXMULTI%' "
+            "   OR UPPER(COALESCE(event_id, '')) LIKE 'KXMULTI%'"
         ).fetchone()
-        kxmve_count = int(kxmve_row[0]) if kxmve_row is not None else 0
+        combo_count = int(combo_row[0]) if combo_row is not None else 0
 
         distinct_markets = con.execute(
             "SELECT DISTINCT venue, market_id, event_id, title, category FROM snapshots"
@@ -297,8 +326,10 @@ def verify_l2_snapshots(
             )
         )
         exclusions_ok = True
-        if kxmve_count > 0:
-            failures.append(f"(e) Found {kxmve_count} row(s) matching excluded KXMVE* prefix.")
+        if combo_count > 0:
+            failures.append(
+                f"(e) Found {combo_count} row(s) matching excluded KXMVE*/KXMULTI* prefix."
+            )
             exclusions_ok = False
         if crypto_short_term_ids:
             sample = ", ".join(crypto_short_term_ids[:5])
@@ -370,7 +401,7 @@ def format_markdown_summary(report: VerificationReport) -> str:
             "no_duplicates",
             "(d) Zero duplicates on `(snapshot_date, venue, market_id, outcome_side)`",
         ),
-        ("no_excluded_markets", "(e) Zero `KXMVE*` and zero 5m/15m crypto markets"),
+        ("no_excluded_markets", "(e) Zero `KXMVE*`/`KXMULTI*` and zero 5m/15m crypto markets"),
         (
             "venue_and_reason_breakdown",
             "(f) Venue presence & `target_series`/`volume_core` breakdown",

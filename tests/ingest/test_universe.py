@@ -501,6 +501,42 @@ def test_is_short_term_crypto_excludes_5m_15m_and_intraday_up_down(
                 category="Sports",
             ),
         ),
+        (
+            "kalshi_btc_25m_not_5m",
+            _kalshi_meta(
+                market_id="KXBTC25M-26DEC",
+                event_id="KXBTC25M-26DEC",
+                title="Bitcoin monthly milestone",
+                category="Crypto",
+            ),
+        ),
+        (
+            "kalshi_btc_2025m_not_5m",
+            _kalshi_meta(
+                market_id="KXBTC2025M-DEC",
+                event_id="KXBTC2025M-DEC",
+                title="Bitcoin 2025 monthly close",
+                category="Crypto",
+            ),
+        ),
+        (
+            "kalshi_eth_45m_not_5m",
+            _kalshi_meta(
+                market_id="KXETH45M-26NOV",
+                event_id="KXETH45M-26NOV",
+                title="Ethereum 45M active addresses",
+                category="Crypto",
+            ),
+        ),
+        (
+            "kalshi_btc_115m_not_15m",
+            _kalshi_meta(
+                market_id="KXBTC115M-26NOV",
+                event_id="KXBTC115M-26NOV",
+                title="Bitcoin 115M milestone",
+                category="Crypto",
+            ),
+        ),
     ],
 )
 def test_is_short_term_crypto_avoids_false_positives(label: str, meta: MarketMetadata) -> None:

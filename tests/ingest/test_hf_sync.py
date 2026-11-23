@@ -414,3 +414,52 @@ def test_cli_upload_hf_flags_and_behaviors(
     io_fail = capsys.readouterr()
     assert rc_fail != 0
     assert "ERROR: Hugging Face upload failed:" in io_fail.err
+
+
+def test_cli_upload_only_skips_collection_and_respects_dry_run(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """--upload-only uploads an existing Parquet without calling collect_daily_l2."""
+    cli = _load_cli_module()
+    parquet_path = _write_valid_snapshot(tmp_path / "2026-12-01.parquet", rows=2)
+
+    async def _must_not_collect(**kwargs: Any) -> CollectionSummary:
+        raise AssertionError("collect_daily_l2 must not be invoked in --upload-only mode")
+
+    upload_calls: list[dict[str, Any]] = []
+
+    def _fake_upload(local_path: Path, *, repo_id: str | None = None) -> str:
+        upload_calls.append({"local_path": local_path, "repo_id": repo_id})
+        return "https://huggingface.co/datasets/pm-quant-org/l2-snapshots/commit/verified"
+
+    monkeypatch.setattr(cli, "collect_daily_l2", _must_not_collect)
+    monkeypatch.setattr(cli, "upload_daily_parquet", _fake_upload)
+
+    # --upload-only + --dry-run skips upload cleanly.
+    rc_dry = cli.main(["--upload-only", str(parquet_path), "--dry-run"])
+    io_dry = capsys.readouterr()
+    assert rc_dry == 0
+    assert upload_calls == []
+    assert "Skipping Hugging Face upload" in io_dry.out
+
+    # --upload-only uploads the specified verified Parquet directly.
+    rc_ok = cli.main(["--upload-only", str(parquet_path), "--hf-repo", TEST_REPO_ID])
+    io_ok = capsys.readouterr()
+    assert rc_ok == 0
+    assert upload_calls == [{"local_path": parquet_path, "repo_id": TEST_REPO_ID}]
+    assert (
+        "HF upload: https://huggingface.co/datasets/pm-quant-org/l2-snapshots/commit/verified"
+        in (io_ok.out)
+    )
+
+    # --upload-only surfaces upload errors with non-zero exit code.
+    def _fail_upload(local_path: Path, *, repo_id: str | None = None) -> str:
+        raise RuntimeError("upload rejected")
+
+    monkeypatch.setattr(cli, "upload_daily_parquet", _fail_upload)
+    rc_err = cli.main(["--upload-only", str(parquet_path)])
+    io_err = capsys.readouterr()
+    assert rc_err != 0
+    assert "ERROR: Hugging Face upload failed: upload rejected" in io_err.err
