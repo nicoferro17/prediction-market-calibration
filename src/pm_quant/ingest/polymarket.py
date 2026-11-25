@@ -40,6 +40,7 @@ from typing import Any, Final
 
 import httpx
 
+from pm_quant.ingest.historical_schema import ResolvedMarket, parse_gamma_resolved_market
 from pm_quant.ingest.http import (
     DEFAULT_MAX_CONCURRENCY,
     DEFAULT_MAX_RETRIES,
@@ -92,6 +93,30 @@ def _ensure_utc(dt: datetime, field_name: str) -> datetime:
     if dt.tzinfo is None or dt.utcoffset() is None:
         raise ValueError(f"{field_name} must be timezone-aware (UTC), got naive datetime {dt!r}")
     return dt.astimezone(UTC)
+
+
+def _format_gamma_iso_utc(value: str | datetime, field_name: str) -> tuple[str, datetime]:
+    """Validate and serialize a Gamma date bound into an ISO-8601 UTC string and ``datetime``."""
+    if isinstance(value, datetime):
+        dt_utc = _ensure_utc(value, field_name)
+        return dt_utc.isoformat().replace("+00:00", "Z"), dt_utc
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            raise ValueError(f"{field_name} must be a non-empty ISO-8601 string or datetime")
+        try:
+            parsed = datetime.fromisoformat(text)
+        except ValueError as exc:
+            raise ValueError(f"invalid ISO-8601 {field_name}: {value!r}") from exc
+        if parsed.tzinfo is None or parsed.utcoffset() is None:
+            dt_utc = parsed.replace(tzinfo=UTC)
+        else:
+            dt_utc = parsed.astimezone(UTC)
+        return dt_utc.isoformat().replace("+00:00", "Z"), dt_utc
+    raise ValueError(
+        f"{field_name} must be an ISO-8601 str or timezone-aware datetime, "
+        f"got {type(value).__name__}"
+    )
 
 
 def _to_epoch_seconds(value: int | datetime, field_name: str) -> int:
@@ -766,6 +791,8 @@ class PolymarketClient:
         ascending: bool | None = None,
         tag_id: int | str | None = None,
         slug: str | None = None,
+        end_date_min: str | datetime | None = None,
+        end_date_max: str | datetime | None = None,
     ) -> list[Mapping[str, Any]]:
         if limit < 1 or limit > POLYMARKET_GAMMA_MAX_LIMIT:
             raise ValueError(f"limit must be in [1, {POLYMARKET_GAMMA_MAX_LIMIT}], got {limit}")
@@ -773,6 +800,32 @@ class PolymarketClient:
             raise ValueError(f"offset must be >= 0, got {offset}")
         if max_pages is not None and max_pages < 0:
             raise ValueError(f"max_pages must be >= 0 or None, got {max_pages}")
+
+        end_date_min_iso: str | None = None
+        end_date_min_dt: datetime | None = None
+        if end_date_min is not None:
+            end_date_min_iso, end_date_min_dt = _format_gamma_iso_utc(
+                end_date_min,
+                "end_date_min",
+            )
+
+        end_date_max_iso: str | None = None
+        end_date_max_dt: datetime | None = None
+        if end_date_max is not None:
+            end_date_max_iso, end_date_max_dt = _format_gamma_iso_utc(
+                end_date_max,
+                "end_date_max",
+            )
+
+        if (
+            end_date_min_dt is not None
+            and end_date_max_dt is not None
+            and end_date_min_dt > end_date_max_dt
+        ):
+            raise ValueError(
+                f"end_date_min ({end_date_min_iso}) must be <= end_date_max ({end_date_max_iso})"
+            )
+
         if max_pages == 0:
             return []
 
@@ -799,6 +852,10 @@ class PolymarketClient:
                     params["tag_id"] = tag_str
             if slug is not None and slug.strip():
                 params["slug"] = slug.strip()
+            if end_date_min_iso is not None:
+                params["end_date_min"] = end_date_min_iso
+            if end_date_max_iso is not None:
+                params["end_date_max"] = end_date_max_iso
 
             payload = await self._http.get_json(endpoint, params=params)
             if not isinstance(payload, list):
@@ -835,12 +892,15 @@ class PolymarketClient:
         ascending: bool | None = None,
         tag_id: int | str | None = None,
         slug: str | None = None,
+        end_date_min: str | datetime | None = None,
+        end_date_max: str | datetime | None = None,
     ) -> list[MarketMetadata]:
         """Paginate through Polymarket Gamma ``GET /markets`` with limit/offset pagination.
 
         Stops when an empty or short page (``len(page) < limit``) is returned, or
         once ``max_pages`` pages have been fetched. Deduplicates markets by
-        ``conditionId`` across pages.
+        ``conditionId`` across pages. Optional ``end_date_min`` and
+        ``end_date_max`` bounds are serialized as ISO-8601 UTC timestamps.
         """
         raw_items = await self._fetch_gamma_markets_raw(
             active=active,
@@ -853,6 +913,8 @@ class PolymarketClient:
             ascending=ascending,
             tag_id=tag_id,
             slug=slug,
+            end_date_min=end_date_min,
+            end_date_max=end_date_max,
         )
         results: list[MarketMetadata] = []
         seen_conditions: set[str] = set()
@@ -861,6 +923,58 @@ class PolymarketClient:
             if metadata.market_id not in seen_conditions:
                 seen_conditions.add(metadata.market_id)
                 results.append(metadata)
+        return results
+
+    async def get_resolved_markets(
+        self,
+        *,
+        active: bool | None = None,
+        closed: bool | None = True,
+        archived: bool | None = None,
+        limit: int = DEFAULT_GAMMA_LIMIT,
+        offset: int = 0,
+        max_pages: int | None = None,
+        order: str | None = None,
+        ascending: bool | None = None,
+        tag_id: int | str | None = None,
+        slug: str | None = None,
+        end_date_min: str | datetime | None = None,
+        end_date_max: str | datetime | None = None,
+    ) -> list[ResolvedMarket]:
+        """Fetch closed Gamma ``/markets`` and parse resolved binary ``ResolvedMarket`` objects.
+
+        Delegates payload conversion strictly to :func:`parse_gamma_resolved_market`
+        (leaving :func:`parse_gamma_market` untouched and anti-leakage clean),
+        discarding open, non-binary, void, or ambiguously settled markets and
+        deduplicating by ``conditionId``.
+        """
+        raw_items = await self._fetch_gamma_markets_raw(
+            active=active,
+            closed=closed,
+            archived=archived,
+            limit=limit,
+            offset=offset,
+            max_pages=max_pages,
+            order=order,
+            ascending=ascending,
+            tag_id=tag_id,
+            slug=slug,
+            end_date_min=end_date_min,
+            end_date_max=end_date_max,
+        )
+        results: list[ResolvedMarket] = []
+        seen_conditions: set[str] = set()
+        for item in raw_items:
+            try:
+                resolved = parse_gamma_resolved_market(item)
+            except ValueError:
+                logger.debug("Skipping malformed Gamma market payload during resolved discovery")
+                continue
+            if resolved is None:
+                continue
+            if resolved.metadata.market_id not in seen_conditions:
+                seen_conditions.add(resolved.metadata.market_id)
+                results.append(resolved)
         return results
 
     async def get_live_market_candidates(
@@ -1121,12 +1235,13 @@ class PolymarketClient:
         *,
         limit: int,
         max_pages: int | None,
-    ) -> list[TradeRecord]:
+    ) -> tuple[list[TradeRecord], bool]:
         endpoint = self._data_url("/trades")
         condition_param = ",".join(chunk)
         trades: list[TradeRecord] = []
         cursor: str | None = None
         pages_fetched = 0
+        truncated = False
 
         while True:
             # Data API v2 invariants: ALWAYS use `condition=` (never `market=`),
@@ -1160,20 +1275,59 @@ class PolymarketClient:
                 trades.append(parse_v2_trade(item))
 
             pages_fetched += 1
-            if max_pages is not None and pages_fetched >= max_pages:
-                break
 
             pagination = payload.get("pagination")
-            if not isinstance(pagination, Mapping):
+            has_next_page = False
+            next_cursor: str | None = None
+            if isinstance(pagination, Mapping) and pagination.get("has_more") is not False:
+                candidate_cursor = _non_empty_str(pagination.get("next_cursor"))
+                if candidate_cursor is not None and candidate_cursor != cursor:
+                    has_next_page = True
+                    next_cursor = candidate_cursor
+
+            if not has_next_page:
                 break
-            if pagination.get("has_more") is False:
-                break
-            next_cursor = _non_empty_str(pagination.get("next_cursor"))
-            if next_cursor is None or next_cursor == cursor:
+            if max_pages is not None and pages_fetched >= max_pages:
+                truncated = True
                 break
             cursor = next_cursor
 
-        return trades
+        return trades, truncated
+
+    async def get_trades_with_truncation(
+        self,
+        condition_ids: Sequence[str],
+        max_pages: int | None = None,
+        *,
+        limit: int = DEFAULT_TRADES_LIMIT,
+    ) -> tuple[list[TradeRecord], bool]:
+        """Fetch taker-only trades from ``GET /v2/trades`` and report pagination truncation.
+
+        Returns ``(trades, truncated)`` where ``truncated`` is ``True`` if at
+        least one condition chunk stopped at ``max_pages`` while ``pagination``
+        still indicated another page (``has_more`` not ``False`` with a new
+        ``next_cursor``).
+        """
+        if max_pages is not None and max_pages < 0:
+            raise ValueError(f"max_pages must be >= 0 or None, got {max_pages}")
+        if limit < 1 or limit > POLYMARKET_MAX_TRADES_LIMIT:
+            raise ValueError(f"limit must be in [1, {POLYMARKET_MAX_TRADES_LIMIT}], got {limit}")
+        if max_pages == 0:
+            return [], False
+
+        chunks = _chunk_ids(condition_ids, POLYMARKET_MAX_CONDITION_BATCH)
+        if not chunks:
+            return [], False
+
+        chunk_results = await asyncio.gather(
+            *(self._fetch_trades_chunk(chunk, limit=limit, max_pages=max_pages) for chunk in chunks)
+        )
+        merged: list[TradeRecord] = []
+        any_truncated = False
+        for chunk_trades, chunk_truncated in chunk_results:
+            merged.extend(chunk_trades)
+            any_truncated = any_truncated or chunk_truncated
+        return merged, any_truncated
 
     async def get_trades(
         self,
@@ -1191,24 +1345,12 @@ class PolymarketClient:
         - Paginates via ``pagination.next_cursor`` sent back as ``cursor=``
           (never legacy ``offset=``), capped at ``max_pages`` pages per chunk.
         """
-        if max_pages is not None and max_pages < 0:
-            raise ValueError(f"max_pages must be >= 0 or None, got {max_pages}")
-        if limit < 1 or limit > POLYMARKET_MAX_TRADES_LIMIT:
-            raise ValueError(f"limit must be in [1, {POLYMARKET_MAX_TRADES_LIMIT}], got {limit}")
-        if max_pages == 0:
-            return []
-
-        chunks = _chunk_ids(condition_ids, POLYMARKET_MAX_CONDITION_BATCH)
-        if not chunks:
-            return []
-
-        chunk_results = await asyncio.gather(
-            *(self._fetch_trades_chunk(chunk, limit=limit, max_pages=max_pages) for chunk in chunks)
+        trades, _ = await self.get_trades_with_truncation(
+            condition_ids,
+            max_pages=max_pages,
+            limit=limit,
         )
-        merged: list[TradeRecord] = []
-        for chunk_trades in chunk_results:
-            merged.extend(chunk_trades)
-        return merged
+        return trades
 
     async def _fetch_v2_history_block(
         self,
