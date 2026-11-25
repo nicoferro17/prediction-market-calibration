@@ -9,7 +9,8 @@
 - None.
 
 ## Next Atomic Task
-- Week 3 Block 2: Implement point-in-time Polymarket historical backfill (Gamma closed discovery, Data v2 -> CLOB prices fallback, `/v2/trades` `taker_only=true`, resumable JSONL checkpoint).
+- Week 3 Block 2: Implement point-in-time Polymarket historical backfill (`polymarket.py` `end_date_min/max` + `get_resolved_markets()`, `backfill_polymarket.py`, offline `test_backfill_polymarket.py`).
+  - Locked Block 2 decisions: (1) Gamma monthly chronological slicing via `end_date_min`/`end_date_max` (NEVER `order=volume*`), initial 1.5-2x oversampling before guards; (2) fetch Data v2 prices (`[t_i-7d, t_i]`, `exclude_settlement=True`) -> CLOB fallback (`[t_i-14d, t_i]`) BEFORE `/v2/trades` and skip trades if price missing/outside `[min_price, max_price]`; (3) `/v2/trades` mini-batches of 1-5 `condition_ids` (`taker_only=true`, `cursor=`, `limit=1000`, `max_pages=15`, per-market `trades_truncated`, never Gamma `volume`); (4) resumable append-only JSONL checkpoint `data/backfill_cache/{venue}_{perimeter_hash}.jsonl` (`checkpoint_version`, `perimeter_hash`, `market_id`, `status: ok|skipped`, `skip_reason`, `fetched_at_utc`, `record` with `Decimal` as `str`; ignore truncated tail line, never cache transient HTTP errors); (5) emit `outcome_side="outcome_0"` when `is_yes_no=False`, populate `fee_type` from `metadata.extra`, and keep Kalshi Block 3 default `vol_usd_le_t = sum(vol_contracts * p_candle)` alongside `vol_contracts_le_t` (`vol_unit="contracts_notional"`).
 
 ## Known Issues
 - None.
