@@ -38,7 +38,7 @@ import json
 import logging
 import math
 import re
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal, InvalidOperation
@@ -308,14 +308,15 @@ def stratify_resolved_markets(
     perimeter: BackfillPerimeter,
     *,
     max_markets: int | None = None,
+    eligibility_fn: Callable[[ResolvedMarket], bool] = is_eligible_resolved_polymarket,
 ) -> list[ResolvedMarket]:
-    """Deterministically filter and stratify resolved Polymarket markets by ``(category, YYYY-MM)``.
+    """Deterministically filter and stratify resolved markets by ``(category, YYYY-MM)``.
 
     Steps:
     1. Deduplicate by ``market.metadata.market_id`` (preserving first occurrence).
-    2. Retain only binary non-combo Polymarket markets passing
-       :func:`is_eligible_resolved_polymarket` with ``end_time_utc`` inside
-       ``[perimeter.start_date_utc, perimeter.end_date_utc]``.
+    2. Retain only binary non-combo markets passing ``eligibility_fn``
+       (defaulting to :func:`is_eligible_resolved_polymarket`) with
+       ``end_time_utc`` inside ``[perimeter.start_date_utc, perimeter.end_date_utc]``.
     3. Group into ``(category_norm, YYYY-MM)`` strata, sort members and strata
        deterministically via SHA-256 keyed by ``perimeter.seed``, and select
        round-robin across strata up to ``max_markets`` (defaulting to
@@ -333,7 +334,7 @@ def stratify_resolved_markets(
 
     strata: dict[tuple[str, str], list[ResolvedMarket]] = {}
     for market in deduped.values():
-        if not is_eligible_resolved_polymarket(market):
+        if not eligibility_fn(market):
             continue
         end_time = market.metadata.end_time_utc
         if end_time is None:
@@ -604,6 +605,8 @@ def _load_checkpoint(
     raw_lines = checkpoint_path.read_text(encoding="utf-8").splitlines()
     non_empty_indices = [idx for idx, line in enumerate(raw_lines) if line.strip()]
     last_non_empty_idx = non_empty_indices[-1] if non_empty_indices else -1
+    valid_lines: list[str] = []
+    dropped_trailing = False
 
     for idx in non_empty_indices:
         line = raw_lines[idx]
@@ -617,6 +620,7 @@ def _load_checkpoint(
                     checkpoint_path,
                     exc,
                 )
+                dropped_trailing = True
                 break
             raise ValueError(
                 f"Corrupt JSON on line {idx + 1} of checkpoint {checkpoint_path}"
@@ -629,6 +633,7 @@ def _load_checkpoint(
                     idx + 1,
                     checkpoint_path,
                 )
+                dropped_trailing = True
                 break
             raise ValueError(f"Expected JSON object on line {idx + 1} of {checkpoint_path}")
 
@@ -655,6 +660,7 @@ def _load_checkpoint(
                     idx + 1,
                     checkpoint_path,
                 )
+                dropped_trailing = True
                 break
             raise ValueError(f"Invalid checkpoint entry on line {idx + 1} of {checkpoint_path}")
 
@@ -667,6 +673,7 @@ def _load_checkpoint(
                         idx + 1,
                         checkpoint_path,
                     )
+                    dropped_trailing = True
                     break
                 raise ValueError(
                     f"Missing 'record' payload for ok entry on line {idx + 1} of {checkpoint_path}"
@@ -677,6 +684,12 @@ def _load_checkpoint(
         else:
             skipped_ids.add(market_id)
             ok_records.pop(market_id, None)
+
+        valid_lines.append(line)
+
+    if dropped_trailing:
+        cleaned_text = ("\n".join(valid_lines) + "\n") if valid_lines else ""
+        checkpoint_path.write_text(cleaned_text, encoding="utf-8")
 
     return ok_records, skipped_ids
 

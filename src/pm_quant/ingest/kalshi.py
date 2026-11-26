@@ -29,6 +29,7 @@ from urllib.parse import quote
 
 import httpx
 
+from pm_quant.ingest.historical_schema import ResolvedMarket, parse_kalshi_resolved_market
 from pm_quant.ingest.http import (
     DEFAULT_MAX_CONCURRENCY,
     DEFAULT_MAX_RETRIES,
@@ -484,11 +485,21 @@ class KalshiClient:
         series_ticker: str | None = None,
         event_ticker: str | None = None,
         mve_filter: str | None = None,
+        min_close_ts: int | None = None,
+        max_close_ts: int | None = None,
     ) -> list[Mapping[str, Any]]:
         if limit < 1 or limit > KALSHI_MAX_PAGE_LIMIT:
             raise ValueError(f"limit must be in [1, {KALSHI_MAX_PAGE_LIMIT}], got {limit}")
         if max_pages is not None and max_pages < 0:
             raise ValueError(f"max_pages must be >= 0 or None, got {max_pages}")
+        if min_close_ts is not None and (isinstance(min_close_ts, bool) or min_close_ts < 0):
+            raise ValueError(f"min_close_ts must be a non-negative int, got {min_close_ts!r}")
+        if max_close_ts is not None and (isinstance(max_close_ts, bool) or max_close_ts < 0):
+            raise ValueError(f"max_close_ts must be a non-negative int, got {max_close_ts!r}")
+        if min_close_ts is not None and max_close_ts is not None and min_close_ts > max_close_ts:
+            raise ValueError(
+                f"min_close_ts ({min_close_ts}) must be <= max_close_ts ({max_close_ts})"
+            )
 
         clean_status = _non_empty_str(status)
         clean_series = _non_empty_str(series_ticker)
@@ -528,6 +539,10 @@ class KalshiClient:
             params: dict[str, Any] = {"limit": limit}
             if not archived and clean_status is not None:
                 params["status"] = clean_status
+            if not archived and min_close_ts is not None:
+                params["min_close_ts"] = min_close_ts
+            if not archived and max_close_ts is not None:
+                params["max_close_ts"] = max_close_ts
             if clean_series is not None:
                 params["series_ticker"] = clean_series
             if clean_event is not None:
@@ -576,15 +591,18 @@ class KalshiClient:
         series_ticker: str | None = None,
         event_ticker: str | None = None,
         mve_filter: str | None = None,
+        min_close_ts: int | None = None,
+        max_close_ts: int | None = None,
     ) -> list[MarketMetadata]:
         """Paginate through live (``/markets``) or archived (``/historical/markets``) markets.
 
         Note that ``GET /historical/markets`` only holds settled markets and does
-        not accept a ``status`` query filter (omitted when ``archived=True``).
-        Per Kalshi's 2026 OpenAPI spec, ``/historical/markets`` filters
-        (``series_ticker``, ``event_ticker``, ``mve_filter``) are mutually
-        exclusive and ``mve_filter`` only accepts ``"exclude"``. Results are
-        deduplicated by market ticker across pages.
+        not accept ``status``, ``min_close_ts``, or ``max_close_ts`` query
+        filters (all omitted when ``archived=True``). Per Kalshi's 2026 OpenAPI
+        spec, ``/historical/markets`` filters (``series_ticker``,
+        ``event_ticker``, ``mve_filter``) are mutually exclusive and
+        ``mve_filter`` only accepts ``"exclude"``. Results are deduplicated by
+        market ticker across pages.
         """
         raw_items = await self._fetch_markets_raw(
             status=status,
@@ -594,6 +612,8 @@ class KalshiClient:
             series_ticker=series_ticker,
             event_ticker=event_ticker,
             mve_filter=mve_filter,
+            min_close_ts=min_close_ts,
+            max_close_ts=max_close_ts,
         )
         results: list[MarketMetadata] = []
         seen_tickers: set[str] = set()
@@ -602,6 +622,52 @@ class KalshiClient:
             if metadata.market_id not in seen_tickers:
                 seen_tickers.add(metadata.market_id)
                 results.append(metadata)
+        return results
+
+    async def get_resolved_markets(
+        self,
+        *,
+        archived: bool = False,
+        limit: int = DEFAULT_MARKETS_LIMIT,
+        max_pages: int | None = None,
+        series_ticker: str | None = None,
+        event_ticker: str | None = None,
+        mve_filter: str | None = None,
+        min_close_ts: int | None = None,
+        max_close_ts: int | None = None,
+    ) -> list[ResolvedMarket]:
+        """Fetch settled Kalshi markets and parse into ``ResolvedMarket`` objects.
+
+        Applies ``status='settled'`` (and optional ``min_close_ts``/``max_close_ts``)
+        on ``/markets`` when ``archived=False``, and omits them on
+        ``/historical/markets`` when ``archived=True``. Delegates conversion
+        strictly to :func:`pm_quant.ingest.historical_schema.parse_kalshi_resolved_market`,
+        discarding void, scalar, or unsettled payloads and deduplicating by ticker.
+        """
+        raw_items = await self._fetch_markets_raw(
+            status=None if archived else "settled",
+            archived=archived,
+            limit=limit,
+            max_pages=max_pages,
+            series_ticker=series_ticker,
+            event_ticker=event_ticker,
+            mve_filter=mve_filter,
+            min_close_ts=min_close_ts,
+            max_close_ts=max_close_ts,
+        )
+        results: list[ResolvedMarket] = []
+        seen_tickers: set[str] = set()
+        for item in raw_items:
+            try:
+                resolved = parse_kalshi_resolved_market(item)
+            except ValueError:
+                continue
+            if resolved is None:
+                continue
+            ticker = resolved.metadata.market_id
+            if ticker not in seen_tickers:
+                seen_tickers.add(ticker)
+                results.append(resolved)
         return results
 
     async def get_live_market_candidates(
